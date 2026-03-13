@@ -95,8 +95,9 @@ def evaluate_agent(policy_fn: Callable[[np.ndarray, np.random.Generator], str]) 
         Dictionary of metrics written to scores.txt
     """
 
-    # Number of episodes per difficulty
+    # Number of episodes per difficulty/wall setting
     runs = 10
+    max_steps = 2000
 
     # Optional fast test mode for local debugging only
     if os.environ.get("LOCAL_QUICK", "0") == "1":
@@ -107,8 +108,7 @@ def evaluate_agent(policy_fn: Callable[[np.ndarray, np.random.Generator], str]) 
     base_seed = 0
     scaling_factor = 5
     arena_size = 500
-    max_steps = 1000
-    wall_obstacles = True
+    wall_obstacles_options = [False, True]
 
     # Difficulty levels tested
     # 0 = static
@@ -128,46 +128,52 @@ def evaluate_agent(policy_fn: Callable[[np.ndarray, np.random.Generator], str]) 
 
         level_scores: list[float] = []
 
-        for i in range(runs):
+        for wall_obstacles in wall_obstacles_options:
+            wall_scores: list[float] = []
 
-            seed = base_seed + i
+            for i in range(runs):
+                seed = base_seed + i
 
-            # Create environment
-            env = OBELIX(
-                scaling_factor=scaling_factor,
-                arena_size=arena_size,
-                max_steps=max_steps,
-                wall_obstacles=wall_obstacles,
-                difficulty=difficulty,
-                box_speed=box_speed,
-                seed=seed,
-            )
+                # Create environment
+                env = OBELIX(
+                    scaling_factor=scaling_factor,
+                    arena_size=arena_size,
+                    max_steps=max_steps,
+                    wall_obstacles=wall_obstacles,
+                    difficulty=difficulty,
+                    box_speed=box_speed,
+                    seed=seed,
+                )
 
-            # Reset environment
-            obs = env.reset(seed=seed)
+                # Reset environment
+                obs = env.reset(seed=seed)
 
-            # Random generator passed to  policy
-            rng = np.random.default_rng(seed)
+                # Random generator passed to policy
+                rng = np.random.default_rng(seed)
 
-            total = 0.0
-            done = False
+                total = 0.0
+                done = False
 
-            # -------------------------------------------------
-            # Main interaction loop
-            # This is where YOUR policy() is called
-            # -------------------------------------------------
-            while not done:
-                action = policy_fn(obs, rng)   # <---  function called
-                obs, reward, done = env.step(action, render=False)
-                total += float(reward)
+                # -------------------------------------------------
+                # Main interaction loop
+                # This is where YOUR policy() is called
+                # -------------------------------------------------
+                while not done:
+                    action = policy_fn(obs, rng)   # <--- policy function called
+                    obs, reward, done = env.step(action, render=False)
+                    total += float(reward)
 
-            level_scores.append(total)
-            all_scores.append(total)
+                wall_scores.append(total)
+                level_scores.append(total)
+                all_scores.append(total)
 
-        # Compute statistics for this difficulty
+            wall_tag = "wall" if wall_obstacles else "no_wall"
+            results[f"mean_score_{difficulty}_{wall_tag}"] = float(np.mean(wall_scores))
+            results[f"std_score_{difficulty}_{wall_tag}"] = float(np.std(wall_scores))
+
+        # Aggregate across wall/no-wall for this difficulty.
         mean_score = float(np.mean(level_scores))
         std_score = float(np.std(level_scores))
-
         results[f"mean_score_{difficulty}"] = mean_score
         results[f"std_score_{difficulty}"] = std_score
 
