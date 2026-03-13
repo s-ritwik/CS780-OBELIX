@@ -681,7 +681,9 @@ class OBELIX:
 
     def check_done_state(self):
         # cv2.imshow("added_bot_box", self.bot_mask[:, :, 0] + self.box_frame[:, :, 0])
-        if (self.box_visible or self.enable_push) and np.any(
+        if self.enable_push:
+            self.reward -= 1  # Small step reward for pushing the box (encourages shorter trajectories).
+        elif (self.box_visible or self.enable_push) and np.any(
             (self.bot_mask[:, :, 0] + self.box_frame[:, :, 0]) == 200
         ):
             # self.done = True
