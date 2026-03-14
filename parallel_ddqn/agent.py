@@ -69,9 +69,26 @@ def _load_once() -> None:
         return
 
     here = os.path.dirname(__file__)
-    wpath = os.path.join(here, "weights_cpu.pth")
+    env_override = os.environ.get("OBELIX_WEIGHTS")
+    if env_override:
+        wpath = env_override
+        if not os.path.isabs(wpath):
+            wpath = os.path.join(here, wpath)
+    else:
+        candidate_names = ["weights.pth", "weights_cpu.pth", "weights_gpu.pth"]
+        wpath = None
+        for name in candidate_names:
+            candidate = os.path.join(here, name)
+            if os.path.exists(candidate):
+                wpath = candidate
+                break
+    if wpath is None:
+        raise FileNotFoundError(
+            "No weights file found next to agent.py. "
+            "Expected one of: weights.pth, weights_cpu.pth, weights_gpu.pth."
+        )
     if not os.path.exists(wpath):
-        raise FileNotFoundError("weights.pth not found next to agent.py")
+        raise FileNotFoundError(f"Requested weights file not found: {wpath}")
 
     raw = torch.load(wpath, map_location="cpu")
     if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):

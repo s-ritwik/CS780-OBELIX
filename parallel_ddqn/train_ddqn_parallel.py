@@ -156,8 +156,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--replay_size", type=int, default=1_000_000)
     parser.add_argument("--warmup_steps", type=int, default=20_000)
-    parser.add_argument("--updates_per_iter", type=int, default=1)
-    parser.add_argument("--target_sync_every", type=int, default=2000)
+    parser.add_argument(
+        "--updates_per_iter",
+        type=int,
+        default=0,
+        help=(
+            "Optimizer updates after each synchronous env collection step. "
+            "Use 0 to default to num_envs, which best matches train_ddqn.py."
+        ),
+    )
+    parser.add_argument(
+        "--target_sync_every",
+        type=int,
+        default=2000,
+        help="Target network sync period in optimizer steps.",
+    )
     parser.add_argument("--grad_clip", type=float, default=10.0)
 
     parser.add_argument("--eps_start", type=float, default=1.0)
@@ -198,8 +211,11 @@ def main() -> None:
     if not os.path.exists(obelix_py):
         raise FileNotFoundError(f"Environment file not found: {obelix_py}")
 
+    updates_per_iter = args.num_envs if args.updates_per_iter <= 0 else args.updates_per_iter
+
     print(f"[setup] device={device} num_envs={args.num_envs} difficulty={args.difficulty}")
     print(f"[setup] env_backend={args.env_backend} obelix_py={obelix_py}")
+    print(f"[setup] updates_per_iter={updates_per_iter} target_sync_every={args.target_sync_every}")
     if args.env_backend == "torch":
         print(f"[setup] env_device={args.env_device}")
         if args.env_device in ("cuda", "auto") and args.num_envs > 8:
@@ -209,6 +225,11 @@ def main() -> None:
             )
     if args.env_backend == "torch_vec":
         print(f"[setup] env_device={args.env_device}")
+    if updates_per_iter < args.num_envs:
+        print(
+            "[warn] updates_per_iter is lower than num_envs. "
+            "This is much weaker than train_ddqn.py."
+        )
 
     hidden_dims = tuple(int(h) for h in args.hidden_dims)
     q_net = QNetwork(hidden_dims=hidden_dims).to(device)
@@ -266,7 +287,7 @@ def main() -> None:
 
     env_steps = 0
     grad_steps = 0
-    last_target_sync_env_step = 0
+    last_target_sync_grad_step = 0
     start_time = time.time()
 
     try:
@@ -318,7 +339,7 @@ def main() -> None:
             env_steps += args.num_envs
 
             if replay.size >= max(args.warmup_steps, args.batch_size):
-                for _ in range(args.updates_per_iter):
+                for _ in range(updates_per_iter):
                     sb, ab, rb, s2b, db = replay.sample(args.batch_size, rng)
 
                     sb_t = torch.from_numpy(sb).to(device=device, dtype=torch.float32)
@@ -343,15 +364,12 @@ def main() -> None:
                     optimizer.step()
 
                     grad_steps += 1
-
-            # Match train_ddqn.py sync semantics by env steps, not optimizer steps.
-            if (
-                replay.size >= max(args.warmup_steps, args.batch_size)
-                and args.target_sync_every > 0
-                and (env_steps - last_target_sync_env_step) >= args.target_sync_every
-            ):
-                target_net.load_state_dict(online_state_dict())
-                last_target_sync_env_step = env_steps
+                    if (
+                        args.target_sync_every > 0
+                        and (grad_steps - last_target_sync_grad_step) >= args.target_sync_every
+                    ):
+                        target_net.load_state_dict(online_state_dict())
+                        last_target_sync_grad_step = grad_steps
 
             if env_steps % args.log_interval < args.num_envs:
                 elapsed = max(1e-6, time.time() - start_time)
@@ -377,6 +395,7 @@ def main() -> None:
         "hidden_dims": [int(h) for h in args.hidden_dims],
         "actions": ACTIONS,
         "config": vars(args),
+        "effective_updates_per_iter": int(updates_per_iter),
     }
     torch.save(checkpoint, args.out)
     print(
