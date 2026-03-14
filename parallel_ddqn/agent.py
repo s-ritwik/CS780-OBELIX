@@ -69,7 +69,7 @@ def _load_once() -> None:
         return
 
     here = os.path.dirname(__file__)
-    wpath = os.path.join(here, "weights.pth")
+    wpath = os.path.join(here, "weights_cpu.pth")
     if not os.path.exists(wpath):
         raise FileNotFoundError("weights.pth not found next to agent.py")
 

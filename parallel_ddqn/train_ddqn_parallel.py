@@ -7,6 +7,7 @@ evaluate with its own OBELIX runtime and your submitted policy(obs, rng).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import random
 import time
@@ -19,6 +20,17 @@ from torch import nn, optim
 
 from ddqn_model import ACTIONS, QNetwork
 from parallel_env import ParallelOBELIX
+
+
+def import_symbol(py_file: str, symbol: str):
+    spec = importlib.util.spec_from_file_location("obelix_module", py_file)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not import {symbol} from {py_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, symbol):
+        raise AttributeError(f"{symbol} not found in {py_file}")
+    return getattr(module, symbol)
 
 
 class ReplayBuffer:
@@ -60,7 +72,11 @@ class ReplayBuffer:
         self.size = min(self.size + n, self.capacity)
 
     def sample(self, batch_size: int, rng: np.random.Generator):
-        idx = rng.integers(0, self.size, size=int(batch_size))
+        batch = int(batch_size)
+        if batch > self.size:
+            raise ValueError(f"batch_size {batch} > replay size {self.size}")
+        # Match train_ddqn.py behavior: sample without replacement.
+        idx = rng.choice(self.size, size=batch, replace=False)
         return self.s[idx], self.a[idx], self.r[idx], self.s2[idx], self.d[idx]
 
 
@@ -91,9 +107,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--env_backend",
         type=str,
-        choices=["numpy", "torch"],
+        choices=["numpy", "torch", "torch_vec"],
         default="numpy",
-        help="Environment implementation backend: numpy=obelix.py, torch=obelix_torch.py",
+        help=(
+            "Environment backend: "
+            "numpy=obelix.py via subprocess workers, "
+            "torch=obelix_torch.py via subprocess workers, "
+            "torch_vec=single-process batched OBELIXVectorized."
+        ),
     )
     parser.add_argument(
         "--obelix_py",
@@ -171,6 +192,7 @@ def main() -> None:
     default_impl = {
         "numpy": os.path.join(repo_dir, "obelix.py"),
         "torch": os.path.join(repo_dir, "obelix_torch.py"),
+        "torch_vec": os.path.join(repo_dir, "obelix_torch.py"),
     }
     obelix_py = args.obelix_py if args.obelix_py is not None else default_impl[args.env_backend]
     if not os.path.exists(obelix_py):
@@ -185,6 +207,8 @@ def main() -> None:
                 "[warn] torch env backend on CUDA with many subprocess envs can exhaust GPU memory. "
                 "Start with small num_envs (e.g. 1-8)."
             )
+    if args.env_backend == "torch_vec":
+        print(f"[setup] env_device={args.env_device}")
 
     hidden_dims = tuple(int(h) for h in args.hidden_dims)
     q_net = QNetwork(hidden_dims=hidden_dims).to(device)
@@ -215,14 +239,24 @@ def main() -> None:
     if args.env_backend == "torch":
         if args.env_device != "auto":
             env_kwargs["device"] = args.env_device
+    elif args.env_backend == "torch_vec":
+        env_kwargs["device"] = str(device) if args.env_device == "auto" else args.env_device
 
-    vec_env = ParallelOBELIX(
-        obelix_py=obelix_py,
-        num_envs=args.num_envs,
-        base_seed=args.seed * 10_000,
-        env_kwargs=env_kwargs,
-        mp_start_method=args.mp_start_method,
-    )
+    if args.env_backend == "torch_vec":
+        VecEnvCls = import_symbol(obelix_py, "OBELIXVectorized")
+        vec_env = VecEnvCls(
+            num_envs=args.num_envs,
+            seed=args.seed * 10_000,
+            **env_kwargs,
+        )
+    else:
+        vec_env = ParallelOBELIX(
+            obelix_py=obelix_py,
+            num_envs=args.num_envs,
+            base_seed=args.seed * 10_000,
+            env_kwargs=env_kwargs,
+            mp_start_method=args.mp_start_method,
+        )
 
     obs = vec_env.reset_all(seed=args.seed * 10_000)
     episode_returns = np.zeros((args.num_envs,), dtype=np.float32)
@@ -232,6 +266,7 @@ def main() -> None:
 
     env_steps = 0
     grad_steps = 0
+    last_target_sync_env_step = 0
     start_time = time.time()
 
     try:
@@ -248,9 +283,11 @@ def main() -> None:
             random_actions = rng.integers(0, len(ACTIONS), size=args.num_envs)
             explore_mask = rng.random(args.num_envs) < epsilon
             action_idx = np.where(explore_mask, random_actions, greedy_actions)
-            actions = [ACTIONS[int(a)] for a in action_idx]
-
-            next_obs, rewards, dones = vec_env.step(actions)
+            if args.env_backend == "torch_vec":
+                next_obs, rewards, dones = vec_env.step(action_idx)
+            else:
+                actions = [ACTIONS[int(a)] for a in action_idx]
+                next_obs, rewards, dones = vec_env.step(actions)
             replay.add_batch(
                 obs,
                 action_idx.astype(np.int64, copy=False),
@@ -306,8 +343,15 @@ def main() -> None:
                     optimizer.step()
 
                     grad_steps += 1
-                    if grad_steps % args.target_sync_every == 0:
-                        target_net.load_state_dict(online_state_dict())
+
+            # Match train_ddqn.py sync semantics by env steps, not optimizer steps.
+            if (
+                replay.size >= max(args.warmup_steps, args.batch_size)
+                and args.target_sync_every > 0
+                and (env_steps - last_target_sync_env_step) >= args.target_sync_every
+            ):
+                target_net.load_state_dict(online_state_dict())
+                last_target_sync_env_step = env_steps
 
             if env_steps % args.log_interval < args.num_envs:
                 elapsed = max(1e-6, time.time() - start_time)

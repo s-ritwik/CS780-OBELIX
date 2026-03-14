@@ -141,7 +141,7 @@ def main() -> None:
 
     parser.add_argument("--scaling_factor", type=int, default=5)
     parser.add_argument("--arena_size", type=int, default=500)
-    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--max_steps", type=int, default=2000)
     parser.add_argument("--wall_obstacles", action="store_true")
     parser.add_argument(
         "--difficulty",

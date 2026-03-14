@@ -53,8 +53,25 @@ Notes:
 
 - `--env_backend numpy` uses `CS780-OBELIX/obelix.py`.
 - `--env_backend torch` uses `CS780-OBELIX/obelix_torch.py`.
+- `--env_backend torch_vec` uses `OBELIXVectorized` from `CS780-OBELIX/obelix_torch.py` (single-process batched).
 - You can override either with `--obelix_py /path/to/file.py`.
 - `--env_device` is only for the torch env backend (`cpu`, `cuda`, or `auto`).
+
+## Use single-process vectorized torch backend (recommended for high `num_envs`)
+
+```bash
+python train_ddqn_parallel.py \
+  --env_backend torch_vec \
+  --env_device cuda \
+  --difficulty 0 \
+  --num_envs 512 \
+  --max_steps 2000 \
+  --hidden_dims 128 64 \
+  --total_env_steps 4000000 \
+  --batch_size 8192 \
+  --device cuda \
+  --out weights.pth
+```
 
 ## Build submission
 
