@@ -211,134 +211,6 @@ def format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def heuristic_actions(obs: np.ndarray, step_counters: np.ndarray) -> np.ndarray:
-    obs = np.asarray(obs, dtype=np.float32)
-    step_counters = np.asarray(step_counters, dtype=np.int32)
-
-    left = np.sum(obs[:, :4], axis=1) + 0.5 * np.sum(obs[:, 4:8], axis=1)
-    right = np.sum(obs[:, 12:16], axis=1) + 0.5 * np.sum(obs[:, 8:12], axis=1)
-    front_far = np.sum(obs[:, 4:12:2], axis=1)
-    front_near = np.sum(obs[:, 5:12:2], axis=1)
-    ir_contact = obs[:, 16]
-    stuck = obs[:, 17]
-    diff = left - right
-
-    phase = step_counters % 12
-    actions = np.where(phase < 8, 2, np.where(phase < 10, 1, 3)).astype(np.int64)
-
-    mask = (front_far > 0.0) | (front_near > 0.0)
-    actions[mask] = 2
-    actions[diff >= 0.75] = 1
-    actions[diff >= 2.0] = 0
-    actions[diff <= -0.75] = 3
-    actions[diff <= -2.0] = 4
-
-    mask = (ir_contact > 0.5) | (front_near >= 2.0)
-    actions[mask] = 2
-    actions[stuck > 0.5] = np.where(diff[stuck > 0.5] >= 0.0, 0, 4)
-    return actions
-
-
-def warm_start_policy(
-    model: ActorCritic,
-    optimizer: optim.Optimizer,
-    vec_env,
-    args: argparse.Namespace,
-    device: torch.device,
-) -> None:
-    if args.warm_start_rollouts <= 0:
-        return
-
-    obs = vec_env.reset_all(seed=args.seed * 20_000)
-    step_counters = np.zeros((args.num_envs,), dtype=np.int32)
-    episode_returns = np.zeros((args.num_envs,), dtype=np.float32)
-    recent_demo_returns = deque(maxlen=200)
-    demo_obs_batches: list[np.ndarray] = []
-    demo_action_batches: list[np.ndarray] = []
-    action_counts = np.zeros((len(ACTIONS),), dtype=np.int64)
-
-    print(
-        f"[warm_start] collecting {args.warm_start_rollouts} heuristic rollout(s) "
-        f"with num_envs={args.num_envs} rollout_steps={args.rollout_steps}"
-    )
-    for rollout_idx in range(args.warm_start_rollouts):
-        for step in range(args.rollout_steps):
-            action_idx = heuristic_actions(obs, step_counters)
-            demo_obs_batches.append(np.asarray(obs, dtype=np.float32).copy())
-            demo_action_batches.append(action_idx.copy())
-            action_counts += np.bincount(action_idx, minlength=len(ACTIONS))
-
-            if args.env_backend == "torch_vec":
-                next_obs, rewards, dones = vec_env.step(action_idx)
-            else:
-                actions = [ACTIONS[int(a)] for a in action_idx]
-                next_obs, rewards, dones = vec_env.step(actions)
-
-            episode_returns += rewards
-            step_counters += 1
-
-            done_idx = np.nonzero(dones)[0]
-            if done_idx.size > 0:
-                for idx in done_idx:
-                    recent_demo_returns.append(float(episode_returns[idx]))
-                episode_returns[done_idx] = 0.0
-                step_counters[done_idx] = 0
-                reset_map = vec_env.reset(
-                    env_indices=done_idx.tolist(),
-                    seed=args.seed * 20_000 + rollout_idx * args.rollout_steps * args.num_envs + step * args.num_envs,
-                )
-                for idx, reset_obs in reset_map.items():
-                    next_obs[idx] = reset_obs
-
-            obs = next_obs
-
-        mean_demo_return = float(np.mean(recent_demo_returns)) if recent_demo_returns else float("nan")
-        print(
-            f"[warm_start] rollout={rollout_idx+1}/{args.warm_start_rollouts} "
-            f"recent_demo_return={mean_demo_return:.1f}"
-        )
-
-    obs_arr = np.concatenate(demo_obs_batches, axis=0)
-    act_arr = np.concatenate(demo_action_batches, axis=0)
-    batch_size = int(obs_arr.shape[0])
-    minibatch_size = min(args.warm_start_batch_size, batch_size)
-    total_actions = max(1, int(np.sum(action_counts)))
-    action_mix = " ".join(
-        f"{name}:{(count / total_actions):.2f}" for name, count in zip(ACTIONS, action_counts.tolist())
-    )
-    print(f"[warm_start] action_mix=[{action_mix}] samples={batch_size}")
-
-    model.train()
-    for epoch in range(args.warm_start_epochs):
-        indices = np.random.permutation(batch_size)
-        total_loss = 0.0
-        total_correct = 0
-        total_seen = 0
-        for start in range(0, batch_size, minibatch_size):
-            mb_idx = indices[start : start + minibatch_size]
-            obs_batch = torch.from_numpy(obs_arr[mb_idx]).to(device=device, dtype=torch.float32)
-            act_batch = torch.from_numpy(act_arr[mb_idx]).to(device=device, dtype=torch.long)
-
-            logits, _ = model(obs_batch)
-            loss = F.cross_entropy(logits, act_batch)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-
-            total_loss += float(loss.item()) * len(mb_idx)
-            total_correct += int((logits.argmax(dim=1) == act_batch).sum().item())
-            total_seen += len(mb_idx)
-
-        print(
-            f"[warm_start] epoch={epoch+1}/{args.warm_start_epochs} "
-            f"bc_loss={total_loss / max(1, total_seen):.4f} "
-            f"bc_acc={total_correct / max(1, total_seen):.3f}"
-        )
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Improved PPO trainer for OBELIX")
 
@@ -419,9 +291,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torch_compile", action="store_true")
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--warm_start_rollouts", type=int, default=0)
-    parser.add_argument("--warm_start_epochs", type=int, default=5)
-    parser.add_argument("--warm_start_batch_size", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100_000_0)
     parser.add_argument(
@@ -512,8 +381,6 @@ def main() -> None:
             env_kwargs=env_kwargs,
             mp_start_method=args.mp_start_method,
         )
-
-    warm_start_policy(model, optimizer, vec_env, args, device)
 
     obs = vec_env.reset_all(seed=args.seed * 10_000)
     episode_returns = np.zeros((args.num_envs,), dtype=np.float32)

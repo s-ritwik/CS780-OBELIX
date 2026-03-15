@@ -42,7 +42,7 @@ class OBELIX:
 
         self.reward = 0
         self.sensor_feedback = np.zeros(18)
-        self.rewarded_sensor_bits = np.zeros(17, dtype=bool)
+        self.rewarded_reward_categories = np.zeros(4, dtype=bool)
         self.sensor_feedback_masks = np.zeros(
             (9, self.frame_size[0], self.frame_size[1]), np.uint8
         )
@@ -109,7 +109,7 @@ class OBELIX:
         self.active_state = "F"
         self.stuck_flag = 0
         self.sensor_feedback[:] = 0
-        self.rewarded_sensor_bits[:] = False
+        self.rewarded_reward_categories[:] = False
 
         # Build obstacles first so we can avoid spawning inside/too-close to walls.
         self._build_obstacles()
@@ -724,24 +724,30 @@ class OBELIX:
         #     self.reward = 100
 
     def update_reward(self, record_bits: bool = True):
-        current_positive_bits = self.sensor_feedback[:17].astype(bool)
-        new_positive_bits = current_positive_bits & np.logical_not(self.rewarded_sensor_bits)
+        current_categories = np.array(
+            [
+                bool(np.any(self.sensor_feedback[:4]) or np.any(self.sensor_feedback[12:16])),
+                bool(np.any(self.sensor_feedback[4:12][::2])),
+                bool(np.any(self.sensor_feedback[4:12][1::2])),
+                bool(self.sensor_feedback[16]),
+            ],
+            dtype=bool,
+        )
+        new_categories = current_categories & np.logical_not(self.rewarded_reward_categories)
 
-        left_sensor_reward = np.sum(new_positive_bits[:4] * 1)
-        forward_far_sensor_reward = np.sum(new_positive_bits[4:12][::2] * 2)
-        forward_near_sensor_reward = np.sum(new_positive_bits[4:12][1::2] * 3)
-        right_sensor_reward = np.sum(new_positive_bits[12:16] * 1)
-        ir_sensor_reward = new_positive_bits[16] * 5
+        left_right_reward = float(new_categories[0]) * 1.0
+        forward_far_reward = float(new_categories[1]) * 2.0
+        forward_near_reward = float(new_categories[2]) * 3.0
+        ir_sensor_reward = float(new_categories[3]) * 5.0
         stuck_reward = self.sensor_feedback[17] * (-200)
-        negative_reward = np.sum(np.logical_not(self.sensor_feedback)) * -1
+        negative_reward = -1.0 if (not np.any(self.sensor_feedback[:16])) else 0.0
         self.reward = (
-            left_sensor_reward
-            + forward_far_sensor_reward
-            + forward_near_sensor_reward
-            + right_sensor_reward
+            left_right_reward
+            + forward_far_reward
+            + forward_near_reward
             + ir_sensor_reward
             + stuck_reward
             + negative_reward
         )
         if record_bits:
-            self.rewarded_sensor_bits |= current_positive_bits
+            self.rewarded_reward_categories |= current_categories
