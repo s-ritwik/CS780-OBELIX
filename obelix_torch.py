@@ -59,6 +59,7 @@ class OBELIX:
 
         self.reward = 0.0
         self.sensor_feedback = torch.zeros(18, dtype=torch.float32, device=self.device)
+        self.rewarded_sensor_bits = torch.zeros(17, dtype=torch.bool, device=self.device)
         self.sensor_feedback_masks = torch.zeros(
             (9, self.height, self.width), dtype=torch.uint8, device=self.device
         )
@@ -255,6 +256,7 @@ class OBELIX:
         self.active_state = "F"
         self.stuck_flag = 0
         self.sensor_feedback.zero_()
+        self.rewarded_sensor_bits.zero_()
 
         # Build obstacles first so we can avoid spawning inside/too-close to walls.
         self._build_obstacles()
@@ -331,7 +333,7 @@ class OBELIX:
 
         self._update_frames(show=False)
         self.get_feedback()
-        self.update_reward()
+        self.update_reward(record_bits=False)
         return self._to_numpy_feedback()
 
     def _reset_box_dynamics(self) -> None:
@@ -744,12 +746,16 @@ class OBELIX:
             self.done = True
             self.reward += self.success_bonus
 
-    def update_reward(self):
-        left_sensor_reward = torch.sum(self.sensor_feedback[:4] * 1.0)
-        forward_far_sensor_reward = torch.sum(self.sensor_feedback[4:12][::2] * 2.0)
-        forward_near_sensor_reward = torch.sum(self.sensor_feedback[4:12][1::2] * 3.0)
-        right_sensor_reward = torch.sum(self.sensor_feedback[12:16] * 1.0)
-        ir_sensor_reward = self.sensor_feedback[16] * 5.0
+    def update_reward(self, record_bits: bool = True):
+        current_positive_bits = self.sensor_feedback[:17] > 0.0
+        new_positive_bits = current_positive_bits & (~self.rewarded_sensor_bits)
+        new_positive_bits_f = new_positive_bits.to(torch.float32)
+
+        left_sensor_reward = torch.sum(new_positive_bits_f[:4] * 1.0)
+        forward_far_sensor_reward = torch.sum(new_positive_bits_f[4:12][::2] * 2.0)
+        forward_near_sensor_reward = torch.sum(new_positive_bits_f[4:12][1::2] * 3.0)
+        right_sensor_reward = torch.sum(new_positive_bits_f[12:16] * 1.0)
+        ir_sensor_reward = new_positive_bits_f[16] * 5.0
         stuck_reward = self.sensor_feedback[17] * (-200.0)
         negative_reward = torch.sum(torch.logical_not(self.sensor_feedback.bool()).to(torch.float32)) * -1.0
         self.reward = float(
@@ -761,6 +767,8 @@ class OBELIX:
             + stuck_reward
             + negative_reward
         )
+        if record_bits:
+            self.rewarded_sensor_bits |= current_positive_bits
 
 
 class OBELIXVectorized:
@@ -849,6 +857,7 @@ class OBELIXVectorized:
         self.stuck_flag = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
         self.sensor_feedback = torch.zeros((self.num_envs, 18), dtype=torch.float32, device=self.device)
+        self.rewarded_sensor_bits = torch.zeros((self.num_envs, 17), dtype=torch.bool, device=self.device)
         self.reward = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
         self.obstacles: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
@@ -1029,6 +1038,7 @@ class OBELIXVectorized:
         self.enable_push[idx_t] = False
         self.stuck_flag[idx_t] = 0.0
         self.sensor_feedback[idx_t] = 0.0
+        self.rewarded_sensor_bits[idx_t] = False
         self.reward[idx_t] = 0.0
 
         for local_i, env_id in enumerate(env_indices):
@@ -1036,7 +1046,7 @@ class OBELIXVectorized:
 
         self._reset_box_dynamics(idx_t, rng_list)
         self._compute_feedback()
-        self._update_reward()
+        self._update_reward(record_bits=False)
 
         obs = self.sensor_feedback[idx_t].detach().cpu().numpy().astype(np.float32, copy=True)
         return {int(env_indices[i]): obs[i] for i in range(len(env_indices))}
@@ -1194,12 +1204,16 @@ class OBELIXVectorized:
 
         self.sensor_feedback[:, 17] = self.stuck_flag
 
-    def _update_reward(self) -> None:
-        left_sensor_reward = torch.sum(self.sensor_feedback[:, :4] * 1.0, dim=1)
-        forward_far_sensor_reward = torch.sum(self.sensor_feedback[:, 4:12][:, ::2] * 2.0, dim=1)
-        forward_near_sensor_reward = torch.sum(self.sensor_feedback[:, 4:12][:, 1::2] * 3.0, dim=1)
-        right_sensor_reward = torch.sum(self.sensor_feedback[:, 12:16] * 1.0, dim=1)
-        ir_sensor_reward = self.sensor_feedback[:, 16] * 5.0
+    def _update_reward(self, record_bits: bool = True) -> None:
+        current_positive_bits = self.sensor_feedback[:, :17] > 0.0
+        new_positive_bits = current_positive_bits & (~self.rewarded_sensor_bits)
+        new_positive_bits_f = new_positive_bits.to(torch.float32)
+
+        left_sensor_reward = torch.sum(new_positive_bits_f[:, :4] * 1.0, dim=1)
+        forward_far_sensor_reward = torch.sum(new_positive_bits_f[:, 4:12][:, ::2] * 2.0, dim=1)
+        forward_near_sensor_reward = torch.sum(new_positive_bits_f[:, 4:12][:, 1::2] * 3.0, dim=1)
+        right_sensor_reward = torch.sum(new_positive_bits_f[:, 12:16] * 1.0, dim=1)
+        ir_sensor_reward = new_positive_bits_f[:, 16] * 5.0
         stuck_reward = self.sensor_feedback[:, 17] * (-200.0)
         negative_reward = torch.sum(
             torch.logical_not(self.sensor_feedback.bool()).to(torch.float32), dim=1
@@ -1213,6 +1227,8 @@ class OBELIXVectorized:
             + stuck_reward
             + negative_reward
         )
+        if record_bits:
+            self.rewarded_sensor_bits |= current_positive_bits
 
     def _check_done_state(self) -> None:
         push_mask = self.enable_push & (~self.done)
