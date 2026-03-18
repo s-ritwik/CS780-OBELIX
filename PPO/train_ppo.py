@@ -28,8 +28,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 
+from obs_encoder import ENCODED_OBS_DIM, RAW_OBS_DIM, encode_obs_tensor, infer_use_rec_encoder_from_state_dict
+
 
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
+FW_ACTION_INDEX = ACTIONS.index("FW")
 
 
 def import_symbol(py_file: str, symbol: str):
@@ -57,19 +60,29 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias_const: float = 
     return layer
 
 
+def apply_forward_bias(layer: nn.Linear, fw_bias_init: float) -> None:
+    if fw_bias_init == 0.0:
+        return
+    with torch.no_grad():
+        layer.bias[FW_ACTION_INDEX] += float(fw_bias_init)
+
+
 class ActorCritic(nn.Module):
     def __init__(
         self,
-        obs_dim: int = 18,
+        obs_dim: int = RAW_OBS_DIM,
         action_dim: int = 5,
         hidden_dims: tuple[int, ...] = (128, 64),
+        fw_bias_init: float = 0.0,
+        use_rec_encoder: bool = False,
     ):
         super().__init__()
         if len(hidden_dims) == 0:
             raise ValueError("hidden_dims must contain at least one layer size")
 
         layers: list[nn.Module] = []
-        last_dim = int(obs_dim)
+        self.use_rec_encoder = bool(use_rec_encoder)
+        last_dim = ENCODED_OBS_DIM if self.use_rec_encoder else int(obs_dim)
         for h in hidden_dims:
             h_i = int(h)
             if h_i <= 0:
@@ -81,8 +94,11 @@ class ActorCritic(nn.Module):
         self.backbone = nn.Sequential(*layers)
         self.policy_head = layer_init(nn.Linear(last_dim, int(action_dim)), std=0.01)
         self.value_head = layer_init(nn.Linear(last_dim, 1), std=1.0)
+        apply_forward_bias(self.policy_head, fw_bias_init)
 
     def forward(self, x: torch.Tensor):
+        if self.use_rec_encoder:
+            x = encode_obs_tensor(x)
         feat = self.backbone(x)
         logits = self.policy_head(feat)
         value = self.value_head(feat).squeeze(-1)
@@ -211,6 +227,19 @@ def format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def load_checkpoint_state(checkpoint_path: str):
+    raw = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        state_dict = raw["state_dict"]
+        metadata = raw
+    elif isinstance(raw, dict):
+        state_dict = raw
+        metadata = {}
+    else:
+        raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
+    return state_dict, metadata
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Improved PPO trainer for OBELIX")
 
@@ -291,6 +320,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--torch_compile", action="store_true")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--fw_bias_init",
+        type=float,
+        default=1.0,
+        help="Initial logit bias added to the FW action in the actor head.",
+    )
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used to warm-start model weights before training.",
+    )
+    parser.add_argument(
+        "--rec_enco",
+        action="store_true",
+        help="Use the recommended structured observation encoder before the policy/value network.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100_000_0)
     parser.add_argument(
@@ -339,7 +385,31 @@ def main() -> None:
         print(f"[setup] env_device={args.env_device}")
 
     hidden_dims = tuple(int(h) for h in args.hidden_dims)
-    model = ActorCritic(hidden_dims=hidden_dims).to(device)
+    model = ActorCritic(
+        hidden_dims=hidden_dims,
+        fw_bias_init=args.fw_bias_init,
+        use_rec_encoder=args.rec_enco,
+    ).to(device)
+    if args.rec_enco:
+        print(f"[setup] recommended encoder enabled (input_dim={ENCODED_OBS_DIM})")
+    if args.init_checkpoint is not None:
+        state_dict, metadata = load_checkpoint_state(args.init_checkpoint)
+        ckpt_hidden_dims = metadata.get("hidden_dims")
+        if ckpt_hidden_dims is not None and tuple(int(h) for h in ckpt_hidden_dims) != hidden_dims:
+            raise ValueError(
+                "Checkpoint hidden_dims do not match requested model shape: "
+                f"checkpoint={tuple(int(h) for h in ckpt_hidden_dims)} requested={hidden_dims}"
+            )
+        ckpt_rec_enco = metadata.get("use_rec_encoder")
+        if ckpt_rec_enco is None:
+            ckpt_rec_enco = infer_use_rec_encoder_from_state_dict(state_dict)
+        if bool(ckpt_rec_enco) != bool(args.rec_enco):
+            raise ValueError(
+                "Checkpoint encoder setting does not match this run: "
+                f"checkpoint_use_rec_encoder={bool(ckpt_rec_enco)} requested={bool(args.rec_enco)}"
+            )
+        model.load_state_dict(state_dict, strict=True)
+        print(f"[setup] warm-started model weights from {args.init_checkpoint}")
     if args.torch_compile and hasattr(torch, "compile"):
         model = torch.compile(model)
 
@@ -404,7 +474,7 @@ def main() -> None:
             buffer = RolloutBuffer(
                 num_steps=args.rollout_steps,
                 num_envs=args.num_envs,
-                obs_dim=18,
+                obs_dim=RAW_OBS_DIM,
                 action_dim=len(ACTIONS),
                 device=device,
             )
@@ -600,10 +670,12 @@ def main() -> None:
     total_elapsed = max(0.0, time.time() - start_time)
     checkpoint = {
         "state_dict": online_state_dict(),
-        "obs_dim": 18,
+        "obs_dim": RAW_OBS_DIM,
+        "model_input_dim": ENCODED_OBS_DIM if args.rec_enco else RAW_OBS_DIM,
         "action_dim": len(ACTIONS),
         "hidden_dims": [int(h) for h in hidden_dims],
         "actions": ACTIONS,
+        "use_rec_encoder": bool(args.rec_enco),
         "config": vars(args),
     }
     torch.save(checkpoint, args.out)

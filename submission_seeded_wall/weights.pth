@@ -1,0 +1,21 @@
+{
+  "arena_size": 500,
+  "bot_radius": 30,
+  "box_size": 60,
+  "escape_steps": 6,
+  "forward_step_unit": 5,
+  "gap_x_margin": 60.0,
+  "gap_y_margin": 25.0,
+  "move_angles": {
+    "FW": 0.0,
+    "L22": 22.5,
+    "L45": 45.0,
+    "R22": -22.5,
+    "R45": -45.0
+  },
+  "scaling_factor": 5,
+  "turn_threshold_large": 35.0,
+  "turn_threshold_small": 10.0,
+  "version": 1,
+  "wall_obstacles": true
+}

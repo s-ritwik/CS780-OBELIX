@@ -10,22 +10,84 @@ import torch
 import torch.nn as nn
 
 
+
+RAW_OBS_DIM = 18
+ENCODED_OBS_DIM = 32
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
+STOCHASTIC_POLICY = False
+USE_REC_ENCO = True
+
+def encode_obs_tensor(obs: torch.Tensor) -> torch.Tensor:
+    """Augment the raw 18-bit observation with grouped directional features."""
+    if obs.shape[-1] != RAW_OBS_DIM:
+        raise ValueError(f"Expected obs last dim {RAW_OBS_DIM}, got {obs.shape[-1]}")
+
+    raw = obs.to(dtype=torch.float32)
+    left = raw[..., 0:4]
+    front = raw[..., 4:12]
+    right = raw[..., 12:16]
+    ir = raw[..., 16:17]
+    stuck = raw[..., 17:18]
+
+    left_count = left.sum(dim=-1, keepdim=True)
+    front_count = front.sum(dim=-1, keepdim=True)
+    right_count = right.sum(dim=-1, keepdim=True)
+    front_far_count = front[..., ::2].sum(dim=-1, keepdim=True)
+    front_near_count = front[..., 1::2].sum(dim=-1, keepdim=True)
+    side_mean_count = 0.5 * (left_count + right_count)
+    blind = (raw[..., :16].sum(dim=-1, keepdim=True) == 0.0).to(dtype=torch.float32)
+
+    derived = torch.cat(
+        [
+            (left_count > 0.0).to(dtype=torch.float32),
+            (front_count > 0.0).to(dtype=torch.float32),
+            (right_count > 0.0).to(dtype=torch.float32),
+            ir,
+            stuck,
+            blind,
+            left_count,
+            front_count,
+            right_count,
+            front_far_count,
+            front_near_count,
+            left_count - right_count,
+            right_count - left_count,
+            front_count - side_mean_count,
+        ],
+        dim=-1,
+    )
+    return torch.cat([raw, derived], dim=-1)
+
+
+def infer_use_rec_encoder_from_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
+    first_weight = state_dict.get("backbone.0.weight")
+    if first_weight is None:
+        return False
+    in_features = int(first_weight.shape[1])
+    if in_features == RAW_OBS_DIM:
+        return False
+    if in_features == ENCODED_OBS_DIM:
+        return True
+    raise ValueError(f"Unexpected first-layer input dim in checkpoint: {in_features}")
+
+
 
 
 class ActorCritic(nn.Module):
     def __init__(
         self,
-        obs_dim: int = 18,
+        obs_dim: int = RAW_OBS_DIM,
         action_dim: int = 5,
         hidden_dims: tuple[int, ...] = (128, 64),
+        use_rec_encoder: bool = False,
     ):
         super().__init__()
         if len(hidden_dims) == 0:
             raise ValueError("hidden_dims must contain at least one layer size")
 
         layers: list[nn.Module] = []
-        last_dim = int(obs_dim)
+        self.use_rec_encoder = bool(use_rec_encoder)
+        last_dim = 32 if self.use_rec_encoder else int(obs_dim)
         for h in hidden_dims:
             h_i = int(h)
             layers.append(nn.Linear(last_dim, h_i))
@@ -37,6 +99,8 @@ class ActorCritic(nn.Module):
         self.value_head = nn.Linear(last_dim, 1)
 
     def forward(self, x: torch.Tensor):
+        if self.use_rec_encoder:
+            x = encode_obs_tensor(x)
         feat = self.backbone(x)
         logits = self.policy_head(feat)
         value = self.value_head(feat).squeeze(-1)
@@ -70,7 +134,7 @@ def _load_once() -> None:
         if not os.path.isabs(wpath):
             wpath = os.path.join(here, wpath)
     else:
-        wpath = os.path.join(here, "weights.pth")
+        wpath = os.path.join(here, "weights_ppo_vec2.pth")
     if not os.path.exists(wpath):
         raise FileNotFoundError(f"Weights file not found: {wpath}")
 
@@ -78,13 +142,23 @@ def _load_once() -> None:
     if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
         state_dict = raw["state_dict"]
         hidden_dims = tuple(int(x) for x in raw.get("hidden_dims", _infer_hidden_dims(state_dict)))
+        ckpt_use_rec_enco = raw.get("use_rec_encoder")
     elif isinstance(raw, dict):
         state_dict = raw
         hidden_dims = _infer_hidden_dims(state_dict)
+        ckpt_use_rec_enco = None
     else:
         raise RuntimeError("Unsupported checkpoint format")
 
-    model = ActorCritic(hidden_dims=hidden_dims)
+    if ckpt_use_rec_enco is None:
+        ckpt_use_rec_enco = infer_use_rec_encoder_from_state_dict(state_dict)
+    if bool(ckpt_use_rec_enco) != bool(USE_REC_ENCO):
+        raise ValueError(
+            "Checkpoint encoder setting does not match agent toggle: "
+            f"checkpoint_use_rec_encoder={bool(ckpt_use_rec_enco)} USE_REC_ENCO={bool(USE_REC_ENCO)}"
+        )
+
+    model = ActorCritic(hidden_dims=hidden_dims, use_rec_encoder=USE_REC_ENCO)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     _MODEL = model
@@ -95,5 +169,10 @@ def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
     _load_once()
     x = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
     logits, _ = _MODEL(x)
-    action = int(torch.argmax(logits, dim=1).item())
+    if STOCHASTIC_POLICY:
+        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.float64, copy=False)
+        probs /= probs.sum()
+        action = int(rng.choice(len(ACTIONS), p=probs))
+    else:
+        action = int(torch.argmax(logits, dim=1).item())
     return ACTIONS[action]

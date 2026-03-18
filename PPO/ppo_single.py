@@ -23,10 +23,18 @@ from torch.distributions import Categorical
 
 
 ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
+FW_ACTION_INDEX = ACTIONS.index("FW")
+
+
+def apply_forward_bias(layer: nn.Linear, fw_bias_init: float) -> None:
+    if fw_bias_init == 0.0:
+        return
+    with torch.no_grad():
+        layer.bias[FW_ACTION_INDEX] += float(fw_bias_init)
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int = 18, action_dim: int = 5, hidden_dims=(64, 64)):
+    def __init__(self, obs_dim: int = 18, action_dim: int = 5, hidden_dims=(64, 64), fw_bias_init: float = 0.0):
         super().__init__()
         h1, h2 = int(hidden_dims[0]), int(hidden_dims[1])
         self.backbone = nn.Sequential(
@@ -37,6 +45,7 @@ class ActorCritic(nn.Module):
         )
         self.policy_head = nn.Linear(h2, action_dim)
         self.value_head = nn.Linear(h2, 1)
+        apply_forward_bias(self.policy_head, fw_bias_init)
 
     def forward(self, x: torch.Tensor):
         feat = self.backbone(x)
@@ -79,6 +88,19 @@ def compute_gae(
 
     returns = advantages + values
     return advantages, returns
+
+
+def load_checkpoint_state(checkpoint_path: str):
+    raw = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        state_dict = raw["state_dict"]
+        metadata = raw
+    elif isinstance(raw, dict):
+        state_dict = raw
+        metadata = {}
+    else:
+        raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
+    return state_dict, metadata
 
 
 def heuristic_action(obs: np.ndarray, step_idx: int) -> int:
@@ -226,6 +248,18 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--normalize_advantages", action="store_true")
     ap.add_argument("--hidden_dims", type=int, nargs=2, default=[64, 64])
+    ap.add_argument(
+        "--fw_bias_init",
+        type=float,
+        default=1.0,
+        help="Initial logit bias added to the FW action in the actor head.",
+    )
+    ap.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used to warm-start model weights before training.",
+    )
     ap.add_argument("--warm_start_episodes", type=int, default=0)
     ap.add_argument("--warm_start_epochs", type=int, default=5)
     ap.add_argument("--warm_start_batch_size", type=int, default=512)
@@ -239,7 +273,17 @@ def main():
     OBELIX = import_obelix(args.obelix_py)
 
     hidden_dims = tuple(int(h) for h in args.hidden_dims)
-    model = ActorCritic(hidden_dims=hidden_dims)
+    model = ActorCritic(hidden_dims=hidden_dims, fw_bias_init=args.fw_bias_init)
+    if args.init_checkpoint is not None:
+        state_dict, metadata = load_checkpoint_state(args.init_checkpoint)
+        ckpt_hidden_dims = metadata.get("hidden_dims")
+        if ckpt_hidden_dims is not None and tuple(int(h) for h in ckpt_hidden_dims) != hidden_dims:
+            raise ValueError(
+                "Checkpoint hidden_dims do not match requested model shape: "
+                f"checkpoint={tuple(int(h) for h in ckpt_hidden_dims)} requested={hidden_dims}"
+            )
+        model.load_state_dict(state_dict, strict=True)
+        print(f"Warm-started model weights from {args.init_checkpoint}")
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     warm_start_policy(model, optimizer, OBELIX, args)
