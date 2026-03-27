@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 
@@ -8,6 +9,12 @@ PRIVILEGED_DIM = 34
 
 def privileged_obs_dim() -> int:
     return PRIVILEGED_DIM
+
+
+def _to_float_tensor(value, *, target_device: torch.device) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.to(device=target_device, dtype=torch.float32)
+    return torch.as_tensor(value, device=target_device, dtype=torch.float32)
 
 
 def _wall_geometry(vec_env, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -30,8 +37,8 @@ def _wall_geometry(vec_env, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 
 
 def box_goal_distance(vec_env, *, target_device: torch.device) -> torch.Tensor:
-    box_x = vec_env.box_center_x.to(dtype=torch.float32)
-    box_y = vec_env.box_center_y.to(dtype=torch.float32)
+    box_x = _to_float_tensor(vec_env.box_center_x, target_device=target_device)
+    box_y = _to_float_tensor(vec_env.box_center_y, target_device=target_device)
     half = float(vec_env.box_half)
     arena = float(vec_env.arena_size)
 
@@ -46,13 +53,13 @@ def box_goal_distance(vec_env, *, target_device: torch.device) -> torch.Tensor:
 def extract_shaping_metrics(vec_env, *, target_device: torch.device) -> dict[str, torch.Tensor]:
     arena = float(vec_env.arena_size)
 
-    bot_x = vec_env.bot_center_x.to(dtype=torch.float32)
-    bot_y = vec_env.bot_center_y.to(dtype=torch.float32)
-    facing_deg = vec_env.facing_angle.to(dtype=torch.float32)
+    bot_x = _to_float_tensor(vec_env.bot_center_x, target_device=target_device)
+    bot_y = _to_float_tensor(vec_env.bot_center_y, target_device=target_device)
+    facing_deg = _to_float_tensor(vec_env.facing_angle, target_device=target_device)
     facing_rad = torch.deg2rad(facing_deg)
 
-    box_x = vec_env.box_center_x.to(dtype=torch.float32)
-    box_y = vec_env.box_center_y.to(dtype=torch.float32)
+    box_x = _to_float_tensor(vec_env.box_center_x, target_device=target_device)
+    box_y = _to_float_tensor(vec_env.box_center_y, target_device=target_device)
     rel_x = box_x - bot_x
     rel_y = box_y - bot_y
     bot_box_distance = torch.sqrt(rel_x * rel_x + rel_y * rel_y + 1e-6)
@@ -80,9 +87,9 @@ def extract_shaping_metrics(vec_env, *, target_device: torch.device) -> dict[str
         "bot_box_distance": (bot_box_distance / arena).to(device=target_device),
         "heading_alignment": heading_alignment.to(device=target_device),
         "goal_distance": (goal_distance / arena).to(device=target_device),
-        "push_active": vec_env.enable_push.to(device=target_device, dtype=torch.float32),
-        "box_visible": vec_env.box_visible.to(device=target_device, dtype=torch.float32),
-        "stuck": vec_env.stuck_flag.to(device=target_device, dtype=torch.float32),
+        "push_active": _to_float_tensor(vec_env.enable_push, target_device=target_device),
+        "box_visible": _to_float_tensor(vec_env.box_visible, target_device=target_device),
+        "stuck": _to_float_tensor(vec_env.stuck_flag, target_device=target_device),
         "gap_wall_x": (gap_wall_x / arena).to(device=target_device),
         "gap_center_y": (gap_center_y / arena).to(device=target_device),
         "gap_half": (gap_half / arena).to(device=target_device),
@@ -99,13 +106,13 @@ def extract_privileged_obs(vec_env, *, target_device: torch.device) -> torch.Ten
     max_steps = max(1.0, float(vec_env.max_steps))
     bot_radius = float(vec_env.bot_radius)
 
-    bot_x = vec_env.bot_center_x.to(dtype=torch.float32)
-    bot_y = vec_env.bot_center_y.to(dtype=torch.float32)
-    facing_deg = vec_env.facing_angle.to(dtype=torch.float32)
+    bot_x = _to_float_tensor(vec_env.bot_center_x, target_device=target_device)
+    bot_y = _to_float_tensor(vec_env.bot_center_y, target_device=target_device)
+    facing_deg = _to_float_tensor(vec_env.facing_angle, target_device=target_device)
     facing_rad = torch.deg2rad(facing_deg)
 
-    box_x = vec_env.box_center_x.to(dtype=torch.float32)
-    box_y = vec_env.box_center_y.to(dtype=torch.float32)
+    box_x = _to_float_tensor(vec_env.box_center_x, target_device=target_device)
+    box_y = _to_float_tensor(vec_env.box_center_y, target_device=target_device)
     rel_x = box_x - bot_x
     rel_y = box_y - bot_y
     distance = torch.sqrt(rel_x * rel_x + rel_y * rel_y + 1e-6)
@@ -123,6 +130,12 @@ def extract_privileged_obs(vec_env, *, target_device: torch.device) -> torch.Ten
     box_speed = torch.full_like(bot_x, float(vec_env.box_speed) / 5.0)
     gap_wall_x, gap_center_y, gap_half = _wall_geometry(vec_env, bot_x)
     goal_distance = box_goal_distance(vec_env, target_device=bot_x.device)
+    enable_push = _to_float_tensor(vec_env.enable_push, target_device=target_device)
+    box_visible = _to_float_tensor(vec_env.box_visible, target_device=target_device)
+    stuck_flag = _to_float_tensor(vec_env.stuck_flag, target_device=target_device)
+    current_step = _to_float_tensor(vec_env.current_step, target_device=target_device)
+    box_vx = _to_float_tensor(vec_env._box_vx, target_device=target_device)
+    box_vy = _to_float_tensor(vec_env._box_vy, target_device=target_device)
 
     privileged = torch.stack(
         [
@@ -137,15 +150,15 @@ def extract_privileged_obs(vec_env, *, target_device: torch.device) -> torch.Ten
             distance / arena,
             torch.sin(rel_heading),
             torch.cos(rel_heading),
-            vec_env.enable_push.to(dtype=torch.float32),
-            vec_env.box_visible.to(dtype=torch.float32),
-            vec_env.stuck_flag.to(dtype=torch.float32),
-            vec_env.current_step.to(dtype=torch.float32) / max_steps,
+            enable_push,
+            box_visible,
+            stuck_flag,
+            current_step / max_steps,
             wall_flag,
             difficulty,
             box_speed,
-            vec_env._box_vx.to(dtype=torch.float32) / max(1.0, float(vec_env.box_speed)),
-            vec_env._box_vy.to(dtype=torch.float32) / max(1.0, float(vec_env.box_speed)),
+            box_vx / max(1.0, float(vec_env.box_speed)),
+            box_vy / max(1.0, float(vec_env.box_speed)),
             left_margin,
             right_margin,
             bottom_margin,
@@ -159,7 +172,7 @@ def extract_privileged_obs(vec_env, *, target_device: torch.device) -> torch.Ten
             (bot_x - gap_wall_x) / arena,
             (box_x - gap_wall_x) / arena,
             (((bot_x - gap_wall_x) * (box_x - gap_wall_x)) >= 0.0).to(torch.float32),
-            torch.cos(rel_heading) * vec_env.enable_push.to(dtype=torch.float32),
+            torch.cos(rel_heading) * enable_push,
         ],
         dim=1,
     )

@@ -34,11 +34,21 @@ def import_symbol(py_file: str, symbol: str):
     return getattr(module, symbol)
 
 
+def import_module(py_file: str, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, py_file)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not import module from {py_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def collect_teacher_sequences(
     *,
     obelix_py: str,
     env_kwargs: dict,
     feature_config: RecurrentFeatureConfig,
+    expert_path: str,
     episodes: int,
     seed: int,
     min_return: float | None,
@@ -46,6 +56,13 @@ def collect_teacher_sequences(
     success_dup_factor: int,
 ) -> tuple[list[np.ndarray], list[np.ndarray], dict[str, float]]:
     obelix_cls = import_symbol(obelix_py, "OBELIX")
+    expert_policy = None
+    use_scripted_teacher = expert_path == "scripted_teacher"
+    if not use_scripted_teacher:
+        expert_mod = import_module(expert_path, f"seqbc_expert_{abs(hash(expert_path))}")
+        if not hasattr(expert_mod, "policy"):
+            raise AttributeError(f"Expert module {expert_path} does not define policy(obs, rng)")
+        expert_policy = getattr(expert_mod, "policy")
     tracker = PoseMemoryTracker(num_envs=1, config=feature_config, device=torch.device("cpu"))
     sequences_x: list[np.ndarray] = []
     sequences_y: list[np.ndarray] = []
@@ -60,6 +77,7 @@ def collect_teacher_sequences(
         obs = np.asarray(env.reset(seed=episode_seed), dtype=np.float32)
         tracker.reset_all(obs[None, :])
         teacher_state = ScriptedTeacherState()
+        rng = np.random.default_rng(episode_seed)
 
         seq_x: list[np.ndarray] = []
         seq_y: list[int] = []
@@ -68,7 +86,10 @@ def collect_teacher_sequences(
         steps = 0
         while not done:
             seq_x.append(tracker.features().cpu().numpy()[0].astype(np.float32, copy=True))
-            action_name = scripted_teacher_action(env, teacher_state)
+            if use_scripted_teacher:
+                action_name = scripted_teacher_action(env, teacher_state)
+            else:
+                action_name = expert_policy(obs, rng)
             action_idx = ACTIONS.index(action_name)
             seq_y.append(action_idx)
 
@@ -272,6 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
     repo_dir = os.path.dirname(base_dir)
     parser.add_argument("--obelix_py", type=str, default=os.path.join(repo_dir, "obelix.py"))
     parser.add_argument("--out", type=str, default=os.path.join(base_dir, "recurrent_seqbc_teacher.pth"))
+    parser.add_argument("--expert_path", type=str, default="scripted_teacher")
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--max_attempts", type=int, default=500)
     parser.add_argument("--min_return", type=float, default=-500.0)
@@ -343,6 +365,7 @@ def main() -> None:
         obelix_py=args.obelix_py,
         env_kwargs=env_kwargs,
         feature_config=feature_config,
+        expert_path=args.expert_path,
         episodes=args.episodes,
         seed=args.seed + 200_000,
         min_return=args.min_return,

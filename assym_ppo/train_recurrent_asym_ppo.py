@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributions import Categorical
 
 from privileged import extract_privileged_obs, extract_shaping_metrics, privileged_obs_dim
 from recurrent import (
@@ -432,6 +433,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_coef", type=float, default=0.0)
     parser.add_argument("--teacher_coef_final", type=float, default=0.0)
     parser.add_argument("--teacher_decay_steps", type=int, default=1_000_000)
+    parser.add_argument("--teacher_action_prob", type=float, default=0.0)
+    parser.add_argument("--teacher_action_prob_final", type=float, default=0.0)
+    parser.add_argument("--teacher_action_prob_decay_steps", type=int, default=1_000_000)
 
     parser.add_argument("--eval_runs", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=250_000)
@@ -614,13 +618,37 @@ def main() -> None:
                     teacher_actions_t = torch.full((args.num_envs,), -1, dtype=torch.long, device=device)
 
                 with torch.no_grad():
-                    actions_t, log_probs_t, _, values_t, logits_t, next_hidden = model.act(
+                    logits_t, values_t, next_hidden, _ = model.forward_step(
                         actor_obs,
                         privileged_obs,
                         hidden,
                         starts,
-                        temperature=args.policy_temperature,
                     )
+                    temp = max(1e-4, float(args.policy_temperature))
+                    dist_t = Categorical(logits=logits_t / temp)
+                    actions_t = dist_t.sample()
+                    log_probs_t = dist_t.log_prob(actions_t)
+
+                    if args.teacher_action_prob_decay_steps > 0:
+                        teacher_act_progress = min(
+                            1.0,
+                            float(env_steps) / float(max(1, args.teacher_action_prob_decay_steps)),
+                        )
+                    else:
+                        teacher_act_progress = 1.0
+                    current_teacher_action_prob = (
+                        (1.0 - teacher_act_progress) * float(args.teacher_action_prob)
+                        + teacher_act_progress * float(args.teacher_action_prob_final)
+                    )
+                    if current_teacher_action_prob > 0.0:
+                        valid_teacher = teacher_actions_t >= 0
+                        if bool(torch.any(valid_teacher)):
+                            teacher_take_mask = (
+                                torch.rand((args.num_envs,), device=device) < float(current_teacher_action_prob)
+                            ) & valid_teacher
+                            if bool(torch.any(teacher_take_mask)):
+                                actions_t = torch.where(teacher_take_mask, teacher_actions_t, actions_t)
+                                log_probs_t = dist_t.log_prob(actions_t)
 
                 action_idx = actions_t.detach().cpu().numpy()
                 rollout_action_counts += np.bincount(action_idx, minlength=ACTION_DIM)
@@ -831,17 +859,37 @@ def main() -> None:
                     for name, count in zip(ACTIONS, rollout_action_counts.tolist())
                 )
                 teacher_mix = "n/a"
-                if teacher_pool is not None:
+                if (teacher_pool is not None) or (privileged_teacher is not None):
                     rollout_total_teacher_actions = max(1, int(np.sum(teacher_action_counts)))
                     teacher_mix = " ".join(
                         f"{name}:{(count / rollout_total_teacher_actions):.2f}"
                         for name, count in zip(ACTIONS, teacher_action_counts.tolist())
                     )
+                if args.teacher_decay_steps > 0:
+                    teacher_progress = min(1.0, float(env_steps) / float(max(1, args.teacher_decay_steps)))
+                else:
+                    teacher_progress = 1.0
+                current_teacher_coef = (1.0 - teacher_progress) * float(args.teacher_coef) + teacher_progress * float(
+                    args.teacher_coef_final
+                )
+                if args.teacher_action_prob_decay_steps > 0:
+                    teacher_act_progress = min(
+                        1.0,
+                        float(env_steps) / float(max(1, args.teacher_action_prob_decay_steps)),
+                    )
+                else:
+                    teacher_act_progress = 1.0
+                current_teacher_action_prob = (
+                    (1.0 - teacher_act_progress) * float(args.teacher_action_prob)
+                    + teacher_act_progress * float(args.teacher_action_prob_final)
+                )
                 print(
                     f"[train] update={update_idx} env_steps={env_steps} "
                     f"policy_loss={mean_policy_loss:.4f} value_loss={mean_value_loss:.4f} "
                     f"entropy={mean_entropy:.4f} kl={mean_kl:.5f} lr={current_lr:.6f} "
-                    f"bc_loss={mean_bc_loss:.4f} recent_return={recent_mean_return:.1f} "
+                    f"bc_loss={mean_bc_loss:.4f} teacher_coef={current_teacher_coef:.3f} "
+                    f"teacher_act_prob={current_teacher_action_prob:.3f} "
+                    f"recent_return={recent_mean_return:.1f} "
                     f"recent_len={recent_mean_length:.1f} recent_success={recent_success:.3f} "
                     f"actions=[{action_mix}] teacher=[{teacher_mix}] sps={sps:.1f} "
                     f"elapsed={format_hms(elapsed)}"

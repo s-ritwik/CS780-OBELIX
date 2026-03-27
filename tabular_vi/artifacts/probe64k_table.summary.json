@@ -1,0 +1,46 @@
+{
+  "artifacts": {
+    "summary_path": "/home/rycker/study/CS780 RL/CS780-OBELIX/tabular_vi/artifacts/probe64k_table.summary.json",
+    "table_path": "/home/rycker/study/CS780 RL/CS780-OBELIX/tabular_vi/artifacts/probe64k_table.npz"
+  },
+  "config": {
+    "env_kwargs": {
+      "arena_size": 500,
+      "box_speed": 2,
+      "difficulty": 0,
+      "max_steps": 300,
+      "scaling_factor": 5,
+      "wall_obstacles": false
+    },
+    "epsilon_end": 0.05,
+    "epsilon_start": 0.3,
+    "explore_bonus": 1.5,
+    "final_planning_iterations": 150,
+    "gamma": 0.95,
+    "mp_start_method": "fork",
+    "num_workers": 8,
+    "obelix_py": "/home/rycker/study/CS780 RL/CS780-OBELIX/obelix.py",
+    "planning_interval": 16000,
+    "planning_iterations": 30,
+    "seed": 0,
+    "total_env_steps": 64000,
+    "value_tolerance": 1e-05
+  },
+  "evaluation": {
+    "episodes": 64.0,
+    "mean_length": 300.0,
+    "mean_return": -295.6875,
+    "std_return": 8.019263915721941,
+    "success_rate": 0.0
+  },
+  "training": {
+    "elapsed_sec": 92.39063763618469,
+    "env_steps": 64000,
+    "episodes_completed": 213,
+    "mean_return_last_128": -469.265625,
+    "planning_runs": 5,
+    "success_rate": 0.03286384976525822,
+    "unique_edges": 1907,
+    "visited_states": 157
+  }
+}

@@ -1355,3 +1355,721 @@ class OBELIXVectorized:
 
     def close(self) -> None:
         return
+
+
+# Exact exports override the approximate implementations above.
+import os
+import sys
+
+import cv2
+
+try:
+    from obelix import OBELIX as _ExactOBELIX
+except ModuleNotFoundError:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _THIS_DIR not in sys.path:
+        sys.path.insert(0, _THIS_DIR)
+    from obelix import OBELIX as _ExactOBELIX
+
+
+class OBELIX(_ExactOBELIX):
+    """Exact wrapper around obelix.OBELIX with a device kwarg for API parity."""
+
+    def __init__(
+        self,
+        scaling_factor: int,
+        arena_size: int = 500,
+        max_steps: int = 1000,
+        wall_obstacles: bool = False,
+        difficulty: int = 0,
+        box_speed: int = 2,
+        seed: Optional[int] = None,
+        device: Optional[str] = None,
+    ):
+        if device in (None, "auto"):
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        super().__init__(
+            scaling_factor=scaling_factor,
+            arena_size=arena_size,
+            max_steps=max_steps,
+            wall_obstacles=wall_obstacles,
+            difficulty=difficulty,
+            box_speed=box_speed,
+            seed=seed,
+        )
+
+
+class OBELIXVectorized:
+    """Batched OBELIX env that preserves obelix.py semantics exactly."""
+
+    ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
+    MOVE_ANGLES = np.array([45.0, 22.5, 0.0, -22.5, -45.0], dtype=np.float64)
+
+    def __init__(
+        self,
+        num_envs: int,
+        scaling_factor: int,
+        arena_size: int = 500,
+        max_steps: int = 1000,
+        wall_obstacles: bool = False,
+        difficulty: int = 0,
+        box_speed: int = 2,
+        seed: Optional[int] = None,
+        device: Optional[str] = None,
+    ):
+        self.num_envs = int(num_envs)
+        if self.num_envs <= 0:
+            raise ValueError("num_envs must be > 0")
+
+        if device in (None, "auto"):
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        self.scaling_factor = int(scaling_factor)
+        self.arena_size = int(arena_size)
+        self.frame_size = (self.arena_size, self.arena_size, 3)
+        self.height = self.frame_size[0]
+        self.width = self.frame_size[1]
+
+        self.bot_radius = int(self.scaling_factor * 12 / 2)
+        self.forward_step_unit = 5
+        self.move_options = {name: angle for name, angle in zip(self.ACTIONS, self.MOVE_ANGLES.tolist())}
+
+        self.sonar_fov = 20
+        self.sonar_far_range = 30 * self.scaling_factor
+        self.sonar_near_range = 18 * self.scaling_factor
+        self.sonar_range_offset = 9 * self.scaling_factor
+        self.sonar_positions = [-90 - 22, -90 + 22, -45, -22, 22, 45, 90 - 22, 90 + 22]
+        self.sonar_facing_angles = [-90, -90, 0, 0, 0, 0, 90, 90]
+        self.ir_sensor_range = 4 * self.scaling_factor
+
+        self.max_steps = int(max_steps)
+        self.wall_obstacles = bool(wall_obstacles)
+
+        self.difficulty = int(difficulty)
+        self.box_speed = int(box_speed)
+        self.box_blink_enabled = self.difficulty >= 2
+        self.box_move_enabled = self.difficulty >= 3
+        self._blink_on_range = (30, 60)
+        self._blink_off_range = (10, 30)
+
+        self.box_size = int(12 * self.scaling_factor)
+        self.box_half = max(1, self.box_size // 2)
+        self.box_yaw_angle = 30.0
+        self.goal_margin = 20 * self.scaling_factor
+        self.success_bonus = 2000
+
+        self.bot_center_x = np.zeros(self.num_envs, dtype=np.int32)
+        self.bot_center_y = np.zeros(self.num_envs, dtype=np.int32)
+        self.facing_angle = np.zeros(self.num_envs, dtype=np.float64)
+
+        self.box_center_x = np.zeros(self.num_envs, dtype=np.int32)
+        self.box_center_y = np.zeros(self.num_envs, dtype=np.int32)
+        self.box_visible = np.ones(self.num_envs, dtype=bool)
+        self._blink_countdown = np.zeros(self.num_envs, dtype=np.int32)
+        self._box_vx = np.zeros(self.num_envs, dtype=np.int32)
+        self._box_vy = np.zeros(self.num_envs, dtype=np.int32)
+
+        self.current_step = np.zeros(self.num_envs, dtype=np.int32)
+        self.done = np.zeros(self.num_envs, dtype=bool)
+        self.enable_push = np.zeros(self.num_envs, dtype=bool)
+        self.stuck_flag = np.zeros(self.num_envs, dtype=np.int8)
+
+        self.sensor_feedback = np.zeros((self.num_envs, 18), dtype=np.float32)
+        self._sensor_reward_claimed = np.zeros((self.num_envs, 17), dtype=bool)
+        self._just_enabled_push = np.zeros(self.num_envs, dtype=bool)
+        self.reward = np.zeros(self.num_envs, dtype=np.float32)
+
+        self.neg_circle_center_x = np.zeros(self.num_envs, dtype=np.int32)
+        self.neg_circle_center_y = np.zeros(self.num_envs, dtype=np.int32)
+
+        self._sensor_weights = np.zeros(17, dtype=np.float32)
+        self._sensor_weights[:4] = 1.0
+        self._sensor_weights[12:16] = 1.0
+        self._sensor_weights[4:12][::2] = 2.0
+        self._sensor_weights[4:12][1::2] = 3.0
+        self._sensor_weights[16] = 5.0
+
+        self.obstacles: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        self._build_obstacles()
+
+        if seed is None:
+            self.rngs = [np.random.default_rng() for _ in range(self.num_envs)]
+        else:
+            base_seed = int(seed)
+            self.rngs = [np.random.default_rng(base_seed + i) for i in range(self.num_envs)]
+
+        self.reset_all(seed=seed)
+
+    def _build_obstacles(self) -> None:
+        self.obstacles = []
+        if not self.wall_obstacles:
+            return
+
+        wall_thickness = max(6, int(4 * self.scaling_factor))
+        x_center = self.width // 2
+        x1 = x_center - wall_thickness // 2
+        x2 = x_center + wall_thickness // 2
+
+        min_gap = 2 * (self.bot_radius + self.box_half) + max(10, self.forward_step_unit * 2)
+        if min_gap >= (self.height - 40):
+            self.obstacles = []
+            return
+
+        gap_height = max(min_gap, int(12 * self.scaling_factor))
+        gap_y_center = self.height // 2
+        y_top_end = max(10, gap_y_center - gap_height // 2)
+        y_bottom_start = min(self.height - 10, gap_y_center + gap_height // 2)
+
+        self.obstacles.append(((x1, 10), (x2, y_top_end)))
+        self.obstacles.append(((x1, y_bottom_start), (x2, self.height - 10)))
+
+    @staticmethod
+    def _circle_intersects_rect(cx: int, cy: int, radius: int, rect) -> bool:
+        (x1, y1), (x2, y2) = rect
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+        closest_x = min(max(cx, x1), x2)
+        closest_y = min(max(cy, y1), y2)
+        dx = cx - closest_x
+        dy = cy - closest_y
+        return (dx * dx + dy * dy) <= (radius * radius)
+
+    def _clear_of_obstacles(self, cx: int, cy: int, radius: int) -> bool:
+        if not self.wall_obstacles:
+            return True
+        for rect in self.obstacles:
+            if self._circle_intersects_rect(cx, cy, radius, rect):
+                return False
+        return True
+
+    def _reset_box_dynamics_one(self, env_id: int) -> None:
+        rng = self.rngs[env_id]
+        if self.box_blink_enabled:
+            self.box_visible[env_id] = True
+            self._blink_countdown[env_id] = int(
+                rng.integers(self._blink_on_range[0], self._blink_on_range[1] + 1)
+            )
+        else:
+            self.box_visible[env_id] = True
+            self._blink_countdown[env_id] = 0
+
+        if self.box_move_enabled:
+            directions = [
+                (-1, -1),
+                (-1, 0),
+                (-1, 1),
+                (0, -1),
+                (0, 1),
+                (1, -1),
+                (1, 0),
+                (1, 1),
+            ]
+            dx, dy = directions[int(rng.integers(0, len(directions)))]
+            self._box_vx[env_id] = int(dx * max(1, self.box_speed))
+            self._box_vy[env_id] = int(dy * max(1, self.box_speed))
+        else:
+            self._box_vx[env_id] = 0
+            self._box_vy[env_id] = 0
+
+    def _sample_env(self, env_id: int) -> None:
+        rng = self.rngs[env_id]
+        start_clearance = max(1, int(self.forward_step_unit) + 1)
+        bot_bounds_margin = 10 + self.bot_radius + start_clearance
+        box_bounds_margin = 10 + self.box_half
+
+        max_attempts = 5000
+        attempts = 0
+
+        while True:
+            attempts += 1
+            if attempts > max_attempts:
+                raise RuntimeError("Failed to sample a valid initial bot position")
+            bx = int(rng.integers(bot_bounds_margin, self.width - bot_bounds_margin))
+            by = int(rng.integers(bot_bounds_margin, self.height - bot_bounds_margin))
+            if self._clear_of_obstacles(bx, by, self.bot_radius + start_clearance):
+                self.bot_center_x[env_id] = bx
+                self.bot_center_y[env_id] = by
+                break
+
+        self.facing_angle[env_id] = float(int(rng.integers(0, 360)))
+
+        while True:
+            attempts += 1
+            if attempts > max_attempts:
+                raise RuntimeError("Failed to sample a valid initial box position")
+            x = int(rng.integers(box_bounds_margin, self.width - box_bounds_margin))
+            y = int(rng.integers(box_bounds_margin, self.height - box_bounds_margin))
+            if not self._clear_of_obstacles(x, y, self.box_half):
+                continue
+            dx = x - int(self.bot_center_x[env_id])
+            dy = y - int(self.bot_center_y[env_id])
+            min_sep = self.bot_radius + self.box_half + start_clearance
+            if (dx * dx + dy * dy) >= (min_sep * min_sep):
+                self.box_center_x[env_id] = x
+                self.box_center_y[env_id] = y
+                break
+
+        self.box_visible[env_id] = True
+        self._reset_box_dynamics_one(env_id)
+        self.neg_circle_center_x[env_id] = int(
+            rng.integers(box_bounds_margin, self.width - box_bounds_margin)
+        )
+        self.neg_circle_center_y[env_id] = int(
+            rng.integers(box_bounds_margin, self.height - box_bounds_margin)
+        )
+
+    @staticmethod
+    def _bbox_from_points(points: np.ndarray, width: int, height: int, pad: int = 0):
+        x0 = max(0, int(points[:, 0].min()) - int(pad))
+        x1 = min(width - 1, int(points[:, 0].max()) + int(pad))
+        y0 = max(0, int(points[:, 1].min()) - int(pad))
+        y1 = min(height - 1, int(points[:, 1].max()) + int(pad))
+        return x0, y0, x1, y1
+
+    def _box_polygon_rel(self, env_id: int, x0: int, y0: int) -> np.ndarray:
+        half = self.box_half
+        corners = []
+        for i in range(0, 360, 90):
+            x = self.box_center_x[env_id] + half * np.cos(np.deg2rad(self.box_yaw_angle + i))
+            y = self.box_center_y[env_id] + half * np.sin(np.deg2rad(self.box_yaw_angle + i))
+            corners.append([x - x0, y - y0])
+        return np.array([corners], dtype=np.int32)
+
+    def _make_object_patch(self, env_id: int, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
+        work_x0, work_y0, work_x1, work_y1 = x0, y0, x1, y1
+        if self.box_visible[env_id] or self.enable_push[env_id]:
+            box_points = self._box_polygon_rel(env_id, 0, 0).reshape(4, 2)
+            box_x0, box_y0, box_x1, box_y1 = self._bbox_from_points(
+                box_points, self.width, self.height, pad=1
+            )
+            intersects_box = not (
+                box_x1 < x0 or box_x0 > x1 or box_y1 < y0 or box_y0 > y1
+            )
+            if intersects_box:
+                work_x0 = min(work_x0, box_x0)
+                work_y0 = min(work_y0, box_y0)
+                work_x1 = max(work_x1, box_x1)
+                work_y1 = max(work_y1, box_y1)
+
+        h = work_y1 - work_y0 + 1
+        w = work_x1 - work_x0 + 1
+        box_patch = np.zeros((h, w), np.uint8)
+        if self.box_visible[env_id] or self.enable_push[env_id]:
+            cv2.fillPoly(box_patch, self._box_polygon_rel(env_id, work_x0, work_y0), 100)
+
+        if self.wall_obstacles:
+            obstacle_patch = np.zeros((h, w), np.uint8)
+            for p1, p2 in self.obstacles:
+                ox0, oy0 = p1
+                ox1, oy1 = p2
+                if ox1 < work_x0 or ox0 > work_x1 or oy1 < work_y0 or oy0 > work_y1:
+                    continue
+                cv2.rectangle(
+                    obstacle_patch,
+                    (ox0 - work_x0, oy0 - work_y0),
+                    (ox1 - work_x0, oy1 - work_y0),
+                    100,
+                    -1,
+                )
+            object_patch = cv2.addWeighted(box_patch, 1.0, obstacle_patch, 1.0, 0)
+        else:
+            object_patch = box_patch
+
+        if (work_x0, work_y0, work_x1, work_y1) == (x0, y0, x1, y1):
+            return object_patch
+        return object_patch[
+            (y0 - work_y0) : (y1 - work_y0 + 1),
+            (x0 - work_x0) : (x1 - work_x0 + 1),
+        ]
+
+    def _circle_rect_overlap_exact(self, cx: int, cy: int, radius: int) -> bool:
+        if (not self.wall_obstacles) or len(self.obstacles) == 0:
+            return False
+
+        x0 = max(0, cx - radius)
+        x1 = min(self.width - 1, cx + radius)
+        y0 = max(0, cy - radius)
+        y1 = min(self.height - 1, cy + radius)
+
+        h = y1 - y0 + 1
+        w = x1 - x0 + 1
+        circle_patch = np.zeros((h, w), np.uint8)
+        cv2.circle(circle_patch, (cx - x0, cy - y0), radius, 255, -1)
+
+        obstacle_patch = np.zeros((h, w), np.uint8)
+        any_obstacle = False
+        for p1, p2 in self.obstacles:
+            ox0, oy0 = p1
+            ox1, oy1 = p2
+            if ox1 < x0 or ox0 > x1 or oy1 < y0 or oy0 > y1:
+                continue
+            any_obstacle = True
+            cv2.rectangle(
+                obstacle_patch,
+                (ox0 - x0, oy0 - y0),
+                (ox1 - x0, oy1 - y0),
+                255,
+                -1,
+            )
+
+        if not any_obstacle:
+            return False
+        overlap = circle_patch.astype(np.uint16) + obstacle_patch.astype(np.uint16)
+        return bool(np.any(overlap > 255))
+
+    def _box_would_collide(self, new_x: int, new_y: int) -> bool:
+        return self._circle_rect_overlap_exact(new_x, new_y, self.box_half)
+
+    def _would_collide(self, new_x: int, new_y: int) -> bool:
+        return self._circle_rect_overlap_exact(new_x, new_y, self.bot_radius)
+
+    def _box_touches_boundary(self, x: int, y: int) -> bool:
+        half = self.box_half
+        left = x - half
+        right = x + half
+        bottom = y - half
+        top = y + half
+        return (
+            left <= 10
+            or right >= (self.width - 10)
+            or bottom <= 10
+            or top >= (self.height - 10)
+        )
+
+    def _update_box_dynamics_one(self, env_id: int) -> None:
+        if self.enable_push[env_id]:
+            self.box_visible[env_id] = True
+            return
+
+        rng = self.rngs[env_id]
+        if self.box_blink_enabled:
+            self._blink_countdown[env_id] -= 1
+            if self._blink_countdown[env_id] <= 0:
+                self.box_visible[env_id] = not self.box_visible[env_id]
+                if self.box_visible[env_id]:
+                    lo, hi = self._blink_on_range
+                else:
+                    lo, hi = self._blink_off_range
+                self._blink_countdown[env_id] = int(rng.integers(lo, hi + 1))
+
+        if self.box_move_enabled:
+            if float(rng.random()) < 0.05:
+                self._reset_box_dynamics_one(env_id)
+
+            next_x = int(self.box_center_x[env_id] + self._box_vx[env_id])
+            next_y = int(self.box_center_y[env_id] + self._box_vy[env_id])
+
+            min_x = 10 + self.box_half
+            max_x = self.width - 10 - self.box_half
+            min_y = 10 + self.box_half
+            max_y = self.height - 10 - self.box_half
+
+            bounced = False
+            if not (min_x <= next_x <= max_x):
+                bounced = True
+            if not (min_y <= next_y <= max_y):
+                bounced = True
+
+            if self.wall_obstacles and not bounced:
+                for p1, p2 in self.obstacles:
+                    x1, y1 = p1
+                    x2, y2 = p2
+                    x1e, x2e = x1 - self.box_half, x2 + self.box_half
+                    y1e, y2e = y1 - self.box_half, y2 + self.box_half
+                    if (x1e <= next_x <= x2e) and (y1e <= next_y <= y2e):
+                        if abs(self._box_vx[env_id]) >= abs(self._box_vy[env_id]):
+                            self._box_vx[env_id] = -self._box_vx[env_id]
+                        else:
+                            self._box_vy[env_id] = -self._box_vy[env_id]
+                        bounced = True
+                        break
+
+            self.box_center_x[env_id] = int(np.clip(next_x, min_x, max_x))
+            self.box_center_y[env_id] = int(np.clip(next_y, min_y, max_y))
+
+    def _sonar_triangle_rel(
+        self,
+        env_id: int,
+        sensor_index: int,
+        sonar_range: int,
+        noise_reduction: int,
+        x0: int,
+        y0: int,
+    ) -> np.ndarray:
+        sonar_pos_angle = self.sonar_positions[sensor_index]
+        sonar_face_angle = self.sonar_facing_angles[sensor_index]
+        facing = self.facing_angle[env_id]
+        p1_x = self.bot_center_x[env_id] + self.bot_radius * np.cos(np.deg2rad(facing + sonar_pos_angle))
+        p1_y = self.bot_center_y[env_id] + self.bot_radius * np.sin(np.deg2rad(facing + sonar_pos_angle))
+        p2_x = p1_x + sonar_range * np.cos(
+            np.deg2rad(facing + sonar_face_angle + self.sonar_fov // 2 + noise_reduction)
+        )
+        p2_y = p1_y + sonar_range * np.sin(
+            np.deg2rad(facing + sonar_face_angle + self.sonar_fov // 2 + noise_reduction)
+        )
+        p3_x = p1_x + sonar_range * np.cos(
+            np.deg2rad(facing + sonar_face_angle - self.sonar_fov // 2 - noise_reduction)
+        )
+        p3_y = p1_y + sonar_range * np.sin(
+            np.deg2rad(facing + sonar_face_angle - self.sonar_fov // 2 - noise_reduction)
+        )
+        pts = np.array([[p1_x - x0, p1_y - y0], [p2_x - x0, p2_y - y0], [p3_x - x0, p3_y - y0]], dtype=np.int32)
+        return pts.reshape(1, 3, 2)
+
+    def _compute_feedback_one(self, env_id: int) -> np.ndarray:
+        obs = np.zeros((18,), dtype=np.float32)
+
+        for sensor_index in range(8):
+            far_poly_global = self._sonar_triangle_rel(
+                env_id=env_id,
+                sensor_index=sensor_index,
+                sonar_range=self.sonar_far_range,
+                noise_reduction=0,
+                x0=0,
+                y0=0,
+            ).reshape(3, 2)
+            x0, y0, x1, y1 = self._bbox_from_points(far_poly_global, self.width, self.height, pad=1)
+            h = y1 - y0 + 1
+            w = x1 - x0 + 1
+            sensor_patch = np.zeros((h, w), np.uint8)
+
+            for sonar_range, sonar_intensity in zip(
+                [self.sonar_far_range, self.sonar_near_range, self.sonar_range_offset],
+                [100, 50, 0],
+            ):
+                noise_reduction = 2 if sonar_intensity == 0 else 0
+                tri_rel = self._sonar_triangle_rel(
+                    env_id=env_id,
+                    sensor_index=sensor_index,
+                    sonar_range=sonar_range,
+                    noise_reduction=noise_reduction,
+                    x0=x0,
+                    y0=y0,
+                )
+                cv2.fillPoly(sensor_patch, tri_rel, sonar_intensity)
+
+            object_patch = self._make_object_patch(env_id, x0, y0, x1, y1)
+            overlap = sensor_patch.astype(np.uint16) + object_patch.astype(np.uint16)
+            obs[2 * sensor_index] = 1.0 if np.any(overlap == 150) else 0.0
+            obs[2 * sensor_index + 1] = 1.0 if np.any(overlap == 200) else 0.0
+
+        facing = self.facing_angle[env_id]
+        p1_x = int(self.bot_center_x[env_id] + self.bot_radius * np.cos(np.deg2rad(facing)))
+        p1_y = int(self.bot_center_y[env_id] + self.bot_radius * np.sin(np.deg2rad(facing)))
+        p2_x = int(p1_x + self.ir_sensor_range * np.cos(np.deg2rad(facing)))
+        p2_y = int(p1_y + self.ir_sensor_range * np.sin(np.deg2rad(facing)))
+        line_points = np.array([[p1_x, p1_y], [p2_x, p2_y]], dtype=np.int32)
+        x0, y0, x1, y1 = self._bbox_from_points(line_points, self.width, self.height, pad=2)
+        h = y1 - y0 + 1
+        w = x1 - x0 + 1
+        sensor_patch = np.zeros((h, w), np.uint8)
+        cv2.line(sensor_patch, (p1_x - x0, p1_y - y0), (p2_x - x0, p2_y - y0), 50, 2)
+        object_patch = self._make_object_patch(env_id, x0, y0, x1, y1)
+        overlap = sensor_patch.astype(np.uint16) + object_patch.astype(np.uint16)
+        obs[16] = 1.0 if np.any(overlap == 150) else 0.0
+        obs[17] = float(self.stuck_flag[env_id])
+        return obs
+
+    def _bot_box_overlap(self, env_id: int) -> bool:
+        if not (self.box_visible[env_id] or self.enable_push[env_id]):
+            return False
+
+        box_points = self._box_polygon_rel(env_id, 0, 0).reshape(4, 2)
+        bot_points = np.array(
+            [
+                [self.bot_center_x[env_id] - self.bot_radius, self.bot_center_y[env_id] - self.bot_radius],
+                [self.bot_center_x[env_id] + self.bot_radius, self.bot_center_y[env_id] + self.bot_radius],
+            ],
+            dtype=np.int32,
+        )
+        union_points = np.vstack([box_points, bot_points])
+        x0, y0, x1, y1 = self._bbox_from_points(union_points, self.width, self.height, pad=1)
+        h = y1 - y0 + 1
+        w = x1 - x0 + 1
+        bot_patch = np.zeros((h, w), np.uint8)
+        box_patch = np.zeros((h, w), np.uint8)
+        cv2.circle(
+            bot_patch,
+            (int(self.bot_center_x[env_id]) - x0, int(self.bot_center_y[env_id]) - y0),
+            self.bot_radius,
+            100,
+            -1,
+        )
+        cv2.fillPoly(box_patch, self._box_polygon_rel(env_id, x0, y0), 100)
+        overlap = bot_patch.astype(np.uint16) + box_patch.astype(np.uint16)
+        return bool(np.any(overlap == 200))
+
+    def _update_reward_one(self, env_id: int) -> None:
+        reward = 0.0
+        sensor_bits = self.sensor_feedback[env_id, :17].astype(bool)
+        newly_on = sensor_bits & (~self._sensor_reward_claimed[env_id])
+        if np.any(newly_on):
+            reward += float(np.sum(self._sensor_weights[newly_on]))
+            self._sensor_reward_claimed[env_id] |= sensor_bits
+        if bool(self.sensor_feedback[env_id, 17]):
+            reward += -200.0
+        reward += -1.0
+        self.reward[env_id] = np.float32(reward)
+
+    def _check_done_state_one(self, env_id: int) -> None:
+        if (self.box_visible[env_id] or self.enable_push[env_id]) and self._bot_box_overlap(env_id):
+            if not self.enable_push[env_id]:
+                self.reward[env_id] += 100.0
+                self._just_enabled_push[env_id] = True
+            self.enable_push[env_id] = True
+            self.box_visible[env_id] = True
+            if self._just_enabled_push[env_id]:
+                self.reward[env_id] += -1.0
+
+        if (
+            (not self.done[env_id])
+            and self.enable_push[env_id]
+            and self._box_touches_boundary(int(self.box_center_x[env_id]), int(self.box_center_y[env_id]))
+        ):
+            self.done[env_id] = True
+            self.reward[env_id] += float(self.success_bonus)
+
+    def _action_indices(self, actions) -> np.ndarray:
+        if isinstance(actions, torch.Tensor):
+            idx = actions.detach().cpu().numpy().astype(np.int64, copy=False)
+        else:
+            idx = np.asarray(actions)
+            if idx.dtype.kind in ("U", "S", "O"):
+                lut = {a: i for i, a in enumerate(self.ACTIONS)}
+                idx = np.asarray([lut[str(a)] for a in idx], dtype=np.int64)
+            else:
+                idx = idx.astype(np.int64, copy=False)
+
+        idx = idx.reshape(-1)
+        if idx.size != self.num_envs:
+            raise ValueError(f"Expected {self.num_envs} actions, got {idx.size}")
+        return idx
+
+    def reset(
+        self,
+        env_indices: Optional[List[int]] = None,
+        seed: Optional[int] = None,
+    ):
+        if env_indices is None:
+            env_indices = list(range(self.num_envs))
+        if len(env_indices) == 0:
+            return {}
+
+        out = {}
+        for env_id in env_indices:
+            env_i = int(env_id)
+            if seed is not None:
+                self.rngs[env_i] = np.random.default_rng(int(seed) + env_i)
+
+            self.current_step[env_i] = 0
+            self.done[env_i] = False
+            self.enable_push[env_i] = False
+            self.stuck_flag[env_i] = 0
+            self.sensor_feedback[env_i].fill(0.0)
+            self._sensor_reward_claimed[env_i].fill(False)
+            self._just_enabled_push[env_i] = False
+            self.reward[env_i] = 0.0
+
+            self._sample_env(env_i)
+            self.sensor_feedback[env_i] = self._compute_feedback_one(env_i)
+            self._update_reward_one(env_i)
+            out[env_i] = self.sensor_feedback[env_i].copy()
+        return out
+
+    def reset_all(self, seed: Optional[int] = None) -> np.ndarray:
+        obs_map = self.reset(env_indices=list(range(self.num_envs)), seed=seed)
+        return np.stack([obs_map[i] for i in range(self.num_envs)], axis=0)
+
+    def step(self, actions):
+        action_idx = self._action_indices(actions)
+
+        for env_id in range(self.num_envs):
+            if self.done[env_id]:
+                continue
+
+            self.current_step[env_id] += 1
+            self._just_enabled_push[env_id] = False
+            self._update_box_dynamics_one(env_id)
+
+            angle_change = self.MOVE_ANGLES[int(action_idx[env_id])]
+            self.facing_angle[env_id] += angle_change
+
+            if angle_change == 0.0:
+                bot_center_x_t = int(
+                    self.bot_center_x[env_id]
+                    + self.forward_step_unit * np.cos(np.deg2rad(self.facing_angle[env_id]))
+                )
+                bot_center_y_t = int(
+                    self.bot_center_y[env_id]
+                    + self.forward_step_unit * np.sin(np.deg2rad(self.facing_angle[env_id]))
+                )
+                box_center_x_t = int(
+                    self.box_center_x[env_id]
+                    + self.forward_step_unit * np.cos(np.deg2rad(self.facing_angle[env_id]))
+                )
+                box_center_y_t = int(
+                    self.box_center_y[env_id]
+                    + self.forward_step_unit * np.sin(np.deg2rad(self.facing_angle[env_id]))
+                )
+
+                if self.enable_push[env_id]:
+                    min_x = 10 + self.box_half
+                    max_x = self.width - 10 - self.box_half
+                    min_y = 10 + self.box_half
+                    max_y = self.height - 10 - self.box_half
+                    box_center_x_next = int(np.clip(box_center_x_t, min_x, max_x))
+                    box_center_y_next = int(np.clip(box_center_y_t, min_y, max_y))
+
+                    bot_in_bounds = (
+                        (10 + self.bot_radius) <= bot_center_x_t <= (self.width - 10 - self.bot_radius)
+                    ) and (
+                        (10 + self.bot_radius) <= bot_center_y_t <= (self.height - 10 - self.bot_radius)
+                    )
+
+                    if (
+                        bot_in_bounds
+                        and (not self._would_collide(bot_center_x_t, bot_center_y_t))
+                        and (not self._box_would_collide(box_center_x_next, box_center_y_next))
+                    ):
+                        self.box_center_x[env_id] = box_center_x_next
+                        self.box_center_y[env_id] = box_center_y_next
+                        self.bot_center_x[env_id] = bot_center_x_t
+                        self.bot_center_y[env_id] = bot_center_y_t
+                        self.stuck_flag[env_id] = 0
+                    else:
+                        self.stuck_flag[env_id] = 1
+
+                elif (
+                    (10 + self.bot_radius) <= bot_center_x_t <= (self.width - 10 - self.bot_radius)
+                    and (10 + self.bot_radius) <= bot_center_y_t <= (self.height - 10 - self.bot_radius)
+                ):
+                    if not self._would_collide(bot_center_x_t, bot_center_y_t):
+                        self.bot_center_x[env_id] = bot_center_x_t
+                        self.bot_center_y[env_id] = bot_center_y_t
+                        self.stuck_flag[env_id] = 0
+                    else:
+                        self.stuck_flag[env_id] = 1
+                else:
+                    self.stuck_flag[env_id] = 1
+
+            self.sensor_feedback[env_id] = self._compute_feedback_one(env_id)
+            self._update_reward_one(env_id)
+            self._check_done_state_one(env_id)
+
+            if (not self.done[env_id]) and (self.current_step[env_id] >= self.max_steps):
+                self.done[env_id] = True
+
+        return (
+            self.sensor_feedback.astype(np.float32, copy=True),
+            self.reward.astype(np.float32, copy=True),
+            self.done.astype(bool, copy=True),
+        )
+
+    def close(self) -> None:
+        return
