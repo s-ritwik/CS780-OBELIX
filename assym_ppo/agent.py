@@ -38,17 +38,7 @@ def _load_once() -> None:
     checkpoint = load_checkpoint(_checkpoint_path(), device=torch.device("cpu"))
     actor_hidden_dims = tuple(int(x) for x in checkpoint.get("actor_hidden_dims", [256, 128]))
     feature_payload = checkpoint.get("feature_config", {})
-    feature_config = FeatureConfig(
-        obs_stack=int(feature_payload.get("obs_stack", 8)),
-        action_hist=int(feature_payload.get("action_hist", 4)),
-        max_steps=int(feature_payload.get("max_steps", 300)),
-        contact_clip=float(feature_payload.get("contact_clip", 12.0)),
-        blind_clip=float(feature_payload.get("blind_clip", 50.0)),
-        stuck_clip=float(feature_payload.get("stuck_clip", 10.0)),
-        repeat_clip=float(feature_payload.get("repeat_clip", 20.0)),
-        turn_clip=float(feature_payload.get("turn_clip", 12.0)),
-        stuck_memory_clip=float(feature_payload.get("stuck_memory_clip", 12.0)),
-    )
+    feature_config = FeatureConfig(**feature_payload)
 
     model = ActorOnly(
         actor_dim=feature_config.feature_dim,

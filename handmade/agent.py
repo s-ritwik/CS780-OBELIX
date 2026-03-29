@@ -385,8 +385,15 @@ class HandmadeController:
 _CONTROLLER = HandmadeController()
 
 
+def _episode_key(rng: np.random.Generator) -> int:
+    seed_seq = getattr(rng.bit_generator, "_seed_seq", None)
+    if seed_seq is not None and hasattr(seed_seq, "entropy"):
+        return int(seed_seq.entropy)
+    return id(rng)
+
+
 def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
-    episode_key = id(rng)
+    episode_key = _episode_key(rng)
     if _CONTROLLER.episode_key != episode_key:
         _CONTROLLER.reset(episode_key)
     return _CONTROLLER.act(obs)

@@ -1357,6 +1357,10 @@ class OBELIXVectorized:
         return
 
 
+OBELIXApprox = OBELIX
+OBELIXVectorizedApprox = OBELIXVectorized
+
+
 # Exact exports override the approximate implementations above.
 import os
 import sys

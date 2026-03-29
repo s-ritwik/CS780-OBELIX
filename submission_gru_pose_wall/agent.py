@@ -374,7 +374,7 @@ def load_checkpoint(path: str, device: torch.device) -> dict:
 _MODEL: Optional[GRUPolicy] = None
 _TRACKER: Optional[PoseGRUFeatureTracker] = None
 _HIDDEN: Optional[torch.Tensor] = None
-_LAST_RNG_ID: Optional[int] = None
+_LAST_EPISODE_KEY: Optional[int] = None
 _PENDING_ACTION: Optional[int] = None
 
 
@@ -428,16 +428,23 @@ def _reset_episode(obs: np.ndarray) -> None:
     _PENDING_ACTION = None
 
 
+def _episode_key(rng: np.random.Generator) -> int:
+    seed_seq = getattr(rng.bit_generator, "_seed_seq", None)
+    if seed_seq is not None and hasattr(seed_seq, "entropy"):
+        return int(seed_seq.entropy)
+    return id(rng)
+
+
 @torch.no_grad()
 def policy(obs: np.ndarray, rng: np.random.Generator) -> str:
-    global _LAST_RNG_ID, _PENDING_ACTION, _HIDDEN
+    global _LAST_EPISODE_KEY, _PENDING_ACTION, _HIDDEN
     _load_once()
 
     obs_arr = np.asarray(obs, dtype=np.float32)
-    rng_id = id(rng)
-    if _LAST_RNG_ID != rng_id:
+    episode_key = _episode_key(rng)
+    if _LAST_EPISODE_KEY != episode_key:
         _reset_episode(obs_arr)
-        _LAST_RNG_ID = rng_id
+        _LAST_EPISODE_KEY = episode_key
         starts = torch.ones((1,), dtype=torch.float32)
     else:
         if _PENDING_ACTION is not None:

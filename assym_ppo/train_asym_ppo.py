@@ -312,6 +312,87 @@ def evaluate_actor(
     }
 
 
+def parse_eval_scenarios(
+    spec: str,
+    *,
+    train_difficulty: int,
+    train_wall_obstacles: bool,
+) -> list[dict[str, object]]:
+    raw = (spec or "train").strip()
+    if raw in ("", "train"):
+        return [
+            {
+                "difficulty": int(train_difficulty),
+                "wall_obstacles": bool(train_wall_obstacles),
+                "tag": f"d{int(train_difficulty)}_{'w' if train_wall_obstacles else 'nw'}",
+            }
+        ]
+
+    scenarios: list[dict[str, object]] = []
+    for chunk in raw.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        diff_s, wall_s = token.split(":", 1)
+        wall_token = wall_s.strip().lower()
+        if wall_token in ("w", "wall", "1", "true"):
+            wall = True
+        elif wall_token in ("nw", "nowall", "0", "false"):
+            wall = False
+        else:
+            raise ValueError(f"Unsupported wall token in eval scenario '{token}'")
+        diff = int(diff_s.strip())
+        scenarios.append(
+            {
+                "difficulty": diff,
+                "wall_obstacles": wall,
+                "tag": f"d{diff}_{'w' if wall else 'nw'}",
+            }
+        )
+    if not scenarios:
+        raise ValueError("No eval scenarios parsed")
+    return scenarios
+
+
+@torch.no_grad()
+def evaluate_actor_suite(
+    model: AsymmetricActorCritic,
+    *,
+    feature_config: FeatureConfig,
+    obelix_py: str,
+    base_env_kwargs: dict,
+    scenarios: list[dict[str, object]],
+    runs: int,
+    seed: int,
+    device: torch.device,
+) -> dict[str, float]:
+    results: dict[str, float] = {}
+    means: list[float] = []
+    stds: list[float] = []
+    for idx, scenario in enumerate(scenarios):
+        env_kwargs = dict(base_env_kwargs)
+        env_kwargs["difficulty"] = int(scenario["difficulty"])
+        env_kwargs["wall_obstacles"] = bool(scenario["wall_obstacles"])
+        stats = evaluate_actor(
+            model=model,
+            feature_config=feature_config,
+            obelix_py=obelix_py,
+            env_kwargs=env_kwargs,
+            runs=runs,
+            seed=seed + idx * 10_000,
+            device=device,
+        )
+        tag = str(scenario["tag"])
+        results[f"{tag}_mean"] = float(stats["mean_reward"])
+        results[f"{tag}_std"] = float(stats["std_reward"])
+        means.append(float(stats["mean_reward"]))
+        stds.append(float(stats["std_reward"]))
+
+    results["mean_reward"] = float(np.mean(means))
+    results["std_reward"] = float(np.mean(stds))
+    return results
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Asymmetric PPO trainer for OBELIX")
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -319,8 +400,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--obelix_py", type=str, default=os.path.join(repo_dir, "obelix.py"))
     parser.add_argument("--obelix_torch_py", type=str, default=os.path.join(repo_dir, "obelix_torch.py"))
+    parser.add_argument("--obelix_torch_symbol", type=str, default="OBELIXVectorized")
     parser.add_argument("--out", type=str, default=os.path.join(base_dir, "weights_best.pth"))
     parser.add_argument("--load", type=str, default=None)
+    parser.add_argument("--reset_best_eval", action="store_true")
 
     parser.add_argument("--num_envs", type=int, default=512)
     parser.add_argument("--rollout_steps", type=int, default=128)
@@ -337,6 +420,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--obs_stack", type=int, default=12)
     parser.add_argument("--action_hist", type=int, default=6)
+    parser.add_argument("--pose_clip", type=float, default=500.0)
+    parser.add_argument("--wall_hit_clip", type=float, default=12.0)
+    parser.add_argument("--turn_streak_clip", type=float, default=16.0)
+    parser.add_argument("--forward_streak_clip", type=float, default=16.0)
+    parser.add_argument("--heading_bins", type=int, default=8)
+    parser.add_argument("--use_pose_features", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use_front_strength", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use_wall_hit_memory", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use_streak_features", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--actor_hidden_dims", type=int, nargs="+", default=[512, 256, 128])
     parser.add_argument("--critic_hidden_dims", type=int, nargs="+", default=[1024, 512, 256])
     parser.add_argument("--fw_bias_init", type=float, default=1.0)
@@ -370,6 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warm_start_batch_size", type=int, default=8192)
 
     parser.add_argument("--eval_runs", type=int, default=20)
+    parser.add_argument("--eval_scenarios", type=str, default="train")
     parser.add_argument("--eval_interval", type=int, default=500_000)
     parser.add_argument("--log_interval", type=int, default=250_000)
     parser.add_argument("--seed", type=int, default=0)
@@ -400,8 +493,22 @@ def main() -> None:
         obs_stack=int(args.obs_stack),
         action_hist=int(args.action_hist),
         max_steps=int(args.max_steps),
+        pose_clip=float(args.pose_clip),
+        wall_hit_clip=float(args.wall_hit_clip),
+        turn_streak_clip=float(args.turn_streak_clip),
+        forward_streak_clip=float(args.forward_streak_clip),
+        heading_bins=int(args.heading_bins),
+        use_pose_features=bool(args.use_pose_features),
+        use_front_strength=bool(args.use_front_strength),
+        use_wall_hit_memory=bool(args.use_wall_hit_memory),
+        use_streak_features=bool(args.use_streak_features),
     )
     privileged_dim = privileged_obs_dim()
+    eval_scenarios = parse_eval_scenarios(
+        args.eval_scenarios,
+        train_difficulty=int(args.difficulty),
+        train_wall_obstacles=bool(args.wall_obstacles),
+    )
 
     model = AsymmetricActorCritic(
         actor_dim=feature_config.feature_dim,
@@ -420,7 +527,8 @@ def main() -> None:
         if "full_state_dict" not in checkpoint:
             raise RuntimeError("Asymmetric PPO checkpoints must contain full_state_dict for resume")
         model.load_state_dict(checkpoint["full_state_dict"], strict=True)
-        best_eval = float(checkpoint.get("best_eval", best_eval))
+        if not args.reset_best_eval:
+            best_eval = float(checkpoint.get("best_eval", best_eval))
         print(f"[setup] loaded checkpoint {args.load}")
 
     env_kwargs = {
@@ -454,7 +562,7 @@ def main() -> None:
         )
 
     env_device = str(device) if args.env_device == "auto" else args.env_device
-    vec_env_cls = import_symbol(args.obelix_torch_py, "OBELIXVectorized")
+    vec_env_cls = import_symbol(args.obelix_torch_py, args.obelix_torch_symbol)
     vec_env = vec_env_cls(
         num_envs=args.num_envs,
         scaling_factor=args.scaling_factor,
@@ -469,7 +577,8 @@ def main() -> None:
 
     print(
         f"[setup] device={device} env_device={env_device} num_envs={args.num_envs} "
-        f"wall_obstacles={args.wall_obstacles} difficulty={args.difficulty}"
+        f"wall_obstacles={args.wall_obstacles} difficulty={args.difficulty} "
+        f"vec_symbol={args.obelix_torch_symbol}"
     )
     print(
         f"[setup] actor_dim={feature_config.feature_dim} privileged_dim={privileged_dim} "
@@ -675,19 +784,24 @@ def main() -> None:
                 last_log_env_step = env_steps
 
             if env_steps - last_eval_env_step >= args.eval_interval:
-                eval_stats = evaluate_actor(
+                eval_stats = evaluate_actor_suite(
                     model=model,
                     feature_config=feature_config,
                     obelix_py=args.obelix_py,
-                    env_kwargs=env_kwargs,
+                    base_env_kwargs=env_kwargs,
+                    scenarios=eval_scenarios,
                     runs=args.eval_runs,
                     seed=args.seed + 100_000,
                     device=device,
                 )
+                scenario_summary = " ".join(
+                    f"{key.replace('_mean', '')}:{value:.1f}"
+                    for key, value in eval_stats.items()
+                    if key.endswith("_mean") and key != "mean_reward"
+                )
                 print(
                     f"[eval] env_steps={env_steps} mean={eval_stats['mean_reward']:.1f} "
-                    f"std={eval_stats['std_reward']:.1f} success={eval_stats['success_rate']:.3f} "
-                    f"mean_len={eval_stats['mean_length']:.1f}"
+                    f"std={eval_stats['std_reward']:.1f} {scenario_summary}"
                 )
                 if eval_stats["mean_reward"] > best_eval:
                     best_eval = eval_stats["mean_reward"]
