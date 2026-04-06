@@ -269,14 +269,73 @@ def _choose_push_heading_scalar(env) -> float:
         horizontal_heading = 180.0 if left < right else 0.0
     else:
         wall_x, _ = geom
-        if env.box_center_x <= wall_x:
-            horizontal_dist = left
-            horizontal_heading = 180.0
-        else:
-            horizontal_dist = right
-            horizontal_heading = 0.0
+        return 180.0 if env.box_center_x <= wall_x else 0.0
 
-    return vertical_heading if vertical_dist + 20.0 < horizontal_dist else horizontal_heading
+    return vertical_heading if vertical_dist + 20.0 < min(left, right) else horizontal_heading
+
+
+def _boundary_dist_scalar(env, heading: float) -> float:
+    half = max(1, int(env.box_size // 2))
+    if heading == 0.0:
+        return float((env.frame_size[1] - 10 - half) - env.box_center_x)
+    if heading == 180.0:
+        return float(env.box_center_x - (10 + half))
+    if heading == 90.0:
+        return float((env.frame_size[0] - 10 - half) - env.box_center_y)
+    return float(env.box_center_y - (10 + half))
+
+
+def _next_box_step_clear_scalar(env, heading: float) -> bool:
+    half = max(1, int(env.box_size // 2))
+    min_x = 10 + half
+    max_x = env.frame_size[1] - 10 - half
+    min_y = 10 + half
+    max_y = env.frame_size[0] - 10 - half
+    next_x = int(
+        np.clip(
+            env.box_center_x + env.forward_step_unit * math.cos(math.radians(heading)),
+            min_x,
+            max_x,
+        )
+    )
+    next_y = int(
+        np.clip(
+            env.box_center_y + env.forward_step_unit * math.sin(math.radians(heading)),
+            min_y,
+            max_y,
+        )
+    )
+    return not env._box_would_collide(next_x, next_y)
+
+
+def _attached_push_heading_scalar(env) -> float:
+    outward = _choose_push_heading_scalar(env)
+    candidates = [outward]
+    up = 90.0
+    down = -90.0
+    if _boundary_dist_scalar(env, down) < _boundary_dist_scalar(env, up):
+        candidates.extend([down, up])
+    else:
+        candidates.extend([up, down])
+
+    rel_x = float(env.bot_center_x - env.box_center_x)
+    rel_y = float(env.bot_center_y - env.box_center_y)
+    best_heading = outward
+    best_score = float("inf")
+    for heading in candidates:
+        if not _next_box_step_clear_scalar(env, heading):
+            continue
+        pv_x = math.cos(math.radians(heading))
+        pv_y = math.sin(math.radians(heading))
+        behind = rel_x * pv_x + rel_y * pv_y
+        penalty = 0.0
+        if behind > -8.0:
+            penalty += 5000.0 + 50.0 * (behind + 8.0)
+        score = _boundary_dist_scalar(env, heading) + penalty
+        if score < best_score:
+            best_score = score
+            best_heading = heading
+    return best_heading
 
 
 def _stage_target_scalar(env, push_heading: float) -> tuple[float, float]:
@@ -287,8 +346,8 @@ def _stage_target_scalar(env, push_heading: float) -> tuple[float, float]:
     max_x = float(env.frame_size[1] - 10 - env.bot_radius)
     min_y = float(10 + env.bot_radius)
     max_y = float(env.frame_size[0] - 10 - env.bot_radius)
-    tx = float(env.box_center_x - stage_dist * math.cos(push_rad))
-    ty = float(env.box_center_y - stage_dist * math.sin(push_rad))
+    tx = float(env.box_center_x + 8.0 * getattr(env, "_box_vx", 0) - stage_dist * math.cos(push_rad))
+    ty = float(env.box_center_y + 8.0 * getattr(env, "_box_vy", 0) - stage_dist * math.sin(push_rad))
     return min(max(tx, min_x), max_x), min(max(ty, min_y), max_y)
 
 
@@ -324,16 +383,27 @@ class ScriptedTeacherState:
 
 
 def scripted_teacher_action(env, state: ScriptedTeacherState) -> str:
+    push_heading = _attached_push_heading_scalar(env) if env.enable_push else _choose_push_heading_scalar(env)
+    push_rad = math.radians(push_heading)
+    rel_x = float(env.bot_center_x - env.box_center_x)
+    rel_y = float(env.bot_center_y - env.box_center_y)
+    behind = rel_x * math.cos(push_rad) + rel_y * math.sin(push_rad)
+    lateral = rel_x * (-math.sin(push_rad)) + rel_y * math.cos(push_rad)
+
+    if env.enable_push and behind > -8.0:
+        if abs(lateral) < 1.0:
+            return "L45"
+        return "L45" if lateral > 0.0 else "R45"
+
     if env.stuck_flag:
         if state.escape_steps <= 0:
-            state.escape_steps = 6
+            state.escape_steps = 8
             state.escape_dir *= -1
         state.escape_steps -= 1
-        if state.escape_steps % 2 == 1:
+        if state.escape_steps >= 4:
             return "L45" if state.escape_dir > 0 else "R45"
         return "FW"
 
-    push_heading = _choose_push_heading_scalar(env)
     if env.enable_push:
         desired = push_heading
     else:

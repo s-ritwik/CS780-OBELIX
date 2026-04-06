@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import math
 import os
 import random
 import sys
@@ -162,6 +163,70 @@ class TeacherPool:
     def reset_indices(self, env_indices: list[int], base_seed: int) -> None:
         for offset, env_id in enumerate(env_indices):
             self.rngs[int(env_id)] = np.random.default_rng(int(base_seed + offset))
+
+
+class PrivilegedNoWallTeacherPool:
+    def __init__(self, num_envs: int) -> None:
+        self.num_envs = int(num_envs)
+
+    @staticmethod
+    def _wrap_deg(angle: float) -> float:
+        return ((angle + 180.0) % 360.0) - 180.0
+
+    def act_env_batch(self, vec_env) -> np.ndarray:
+        actions = np.zeros((self.num_envs,), dtype=np.int64)
+        half = max(1, int(vec_env.box_size) // 2)
+        offset = float(vec_env.bot_radius + half + 12)
+
+        for env_id in range(self.num_envs):
+            if bool(vec_env.done[env_id]):
+                actions[env_id] = ACTIONS.index("L22")
+                continue
+
+            box_x = float(vec_env.box_center_x[env_id])
+            box_y = float(vec_env.box_center_y[env_id])
+            bot_x = float(vec_env.bot_center_x[env_id])
+            bot_y = float(vec_env.bot_center_y[env_id])
+            facing = float(vec_env.facing_angle[env_id])
+
+            distances = {
+                "left": box_x - (10 + half),
+                "right": (vec_env.frame_size[1] - 10 - half) - box_x,
+                "bottom": box_y - (10 + half),
+                "top": (vec_env.frame_size[0] - 10 - half) - box_y,
+            }
+            wall = min(distances, key=distances.get)
+            push_angle = {"left": 180.0, "right": 0.0, "bottom": -90.0, "top": 90.0}[wall]
+
+            if bool(vec_env.enable_push[env_id]):
+                desired = push_angle
+            else:
+                ux = math.cos(math.radians(push_angle))
+                uy = math.sin(math.radians(push_angle))
+                stage_x = box_x - offset * ux
+                stage_y = box_y - offset * uy
+                stage_dist = math.hypot(bot_x - stage_x, bot_y - stage_y)
+                if stage_dist <= 20.0:
+                    desired = push_angle
+                else:
+                    desired = math.degrees(math.atan2(stage_y - bot_y, stage_x - bot_x))
+
+            diff = self._wrap_deg(desired - facing)
+            if diff > 50.0:
+                action = "L45"
+            elif diff > 12.0:
+                action = "L22"
+            elif diff < -50.0:
+                action = "R45"
+            elif diff < -12.0:
+                action = "R22"
+            else:
+                action = "FW"
+            actions[env_id] = ACTIONS.index(action)
+        return actions
+
+    def reset_indices(self, env_indices: list[int], base_seed: int) -> None:
+        return
 
 
 def collect_expert_demos(
@@ -336,6 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warm_start_epochs", type=int, default=5)
     parser.add_argument("--warm_start_batch_size", type=int, default=8192)
     parser.add_argument("--teacher_agent_file", type=str, default=None)
+    parser.add_argument("--teacher_mode", type=str, choices=["policy", "privileged_nowall"], default="policy")
     parser.add_argument("--teacher_coef", type=float, default=0.0)
     parser.add_argument("--teacher_coef_final", type=float, default=0.0)
     parser.add_argument("--teacher_decay_steps", type=int, default=1_000_000)
@@ -443,7 +509,13 @@ def main() -> None:
         )
 
     teacher_pool = None
-    if args.teacher_agent_file:
+    if args.teacher_mode == "privileged_nowall":
+        teacher_pool = PrivilegedNoWallTeacherPool(args.num_envs)
+        print(
+            f"[setup] teacher_mode={args.teacher_mode} "
+            f"teacher_coef={args.teacher_coef} teacher_coef_final={args.teacher_coef_final}"
+        )
+    elif args.teacher_agent_file:
         teacher_pool = TeacherPool(args.teacher_agent_file, args.num_envs, args.seed)
         print(
             f"[setup] teacher_agent_file={args.teacher_agent_file} "
@@ -488,7 +560,10 @@ def main() -> None:
                 features = tracker.features()
                 hidden_before = hidden.clone()
                 if teacher_pool is not None:
-                    teacher_idx_np = teacher_pool.act_batch(obs)
+                    if hasattr(teacher_pool, "act_env_batch"):
+                        teacher_idx_np = teacher_pool.act_env_batch(vec_env)
+                    else:
+                        teacher_idx_np = teacher_pool.act_batch(obs)
                     teacher_actions_t = torch.as_tensor(teacher_idx_np, dtype=torch.long, device=device)
                     teacher_action_counts += np.bincount(teacher_idx_np, minlength=ACTION_DIM)
                 else:
