@@ -1,0 +1,611 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  xleftmargin=0.5em,
+  xrightmargin=0.5em
+}
+
+\title{\textbf{Solving OBELIX with Asymmetric PPO, Privileged Critics, and an Observation-Only Switch Policy}}
+\author{CS780 Capstone Project}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report describes the training process that produced the submitted OBELIX policy in
+\path{assym_ppo/submission_switch_d3_v3base/submission_switch_d3_v3base.zip}.  The
+final policy is a two-branch controller: a wall-specialized actor trained with
+asymmetric PPO and a privileged critic, and a difficulty-3 no-wall actor trained with
+high-throughput vectorized PPO.  The submitted agent is CPU-compatible and receives
+only the legal 18-bit observation at inference time.  All additional inference
+features are functions of the current observation, past legal observations, and past
+actions chosen by the policy.  The final local evaluation target was difficulty 3,
+\(T=2000\), with a weighted score
+\[
+  0.4 R_{\text{no-wall}} + 0.6 R_{\text{wall}}.
+\]
+On ten local seeds using \path{evaluate.py}, the selected submission obtained
+\[
+  R_{\text{no-wall}} = 1820.4,\qquad
+  R_{\text{wall}} = -1142.8,\qquad
+  0.4R_{\text{no-wall}} + 0.6R_{\text{wall}} = 42.48.
+\]
+\end{abstract}
+
+\section{Problem Definition}
+
+OBELIX is a partially observable robot-control problem.  A circular robot moves in a
+bounded square arena and must find a square box, attach to it by contact, and push the
+box to a boundary.  The difficulty-3 setting adds two complications: the box can blink
+off and on, and it moves with a random velocity before attachment.  A wall-obstacle
+variant further inserts obstacles in the arena, which creates narrow navigation and
+unwedge cases.
+
+The interaction can be written as a partially observable Markov decision process
+\[
+  \mathcal{P} = (\mathcal{S}, \mathcal{A}, \Omega, P, O, r, \gamma),
+\]
+where the simulator state \(s_t \in \mathcal{S}\) contains the robot pose, box pose,
+box velocity, wall geometry, visibility state, and attachment state.  At deployment,
+the agent is not allowed to read \(s_t\).  It receives only an observation
+\[
+  o_t \in \{0,1\}^{18}.
+\]
+
+The action set is discrete:
+\[
+  \mathcal{A} = \{\texttt{L45},\texttt{L22},\texttt{FW},\texttt{R22},\texttt{R45}\}.
+\]
+The turn actions rotate the robot by \(45^\circ\) or \(22.5^\circ\), and
+\texttt{FW} attempts a forward motion of 5 pixels.  When the box is attached, forward
+motion attempts to translate both the robot and the box.
+
+\section{Legal Observation Space}
+
+The raw observation is a vector of 18 binary values:
+\[
+  o_t =
+  [b_0,\ldots,b_{15}, b_{\text{IR}}, b_{\text{stuck}}].
+\]
+The first 16 bits are sonar/contact-like range bits.  They are grouped by direction:
+\[
+\begin{aligned}
+  \text{left}  &:\quad b_0,\ldots,b_3,\\
+  \text{front} &:\quad b_4,\ldots,b_{11},\\
+  \text{right} &:\quad b_{12},\ldots,b_{15}.
+\end{aligned}
+\]
+The final two bits are the infrared sensor \(b_{\text{IR}}=b_{16}\) and the stuck bit
+\(b_{\text{stuck}}=b_{17}\).  The submitted policy never reads the simulator state,
+reward, done flag, box coordinates, robot coordinates, attachment flag, or any other
+privileged variable.  Inference-time memory is constructed only from legal observations
+and the agent's own previous actions.
+
+\section{Reward Dynamics and Why the Problem Is Conservative}
+
+The reward function is unusually conservative.  A stationary policy that avoids
+contact with walls receives roughly \(-T\) over a horizon of \(T\) steps.  At
+\(T=2000\), doing nothing useful can therefore score around \(-2000\).  A policy that
+occasionally drives into a wall or pushes the box from a bad angle can be much worse,
+because the stuck penalty is very large.
+
+The per-step reward implemented by \path{obelix.py} is:
+\[
+  r_t =
+  -1
+  - 200 \cdot \mathbf{1}\{b_{\text{stuck}}=1\}
+  + r_{\text{sensor-once}}
+  + r_{\text{attach}}
+  + r_{\text{success}}.
+\]
+The one-time sensor rewards are:
+\[
+\begin{array}{ll}
+\text{left/right sonar bits} & +1 \text{ per bit, once per episode},\\
+\text{front far bits}       & +2 \text{ per bit, once per episode},\\
+\text{front near bits}      & +3 \text{ per bit, once per episode},\\
+\text{IR bit}               & +5 \text{ once per episode}.
+\end{array}
+\]
+First attachment gives \(+100\), followed immediately by the normal push-state step
+cost.  Pushing the attached box to a boundary gives a success bonus of \(+2000\).
+
+This makes the credit-assignment problem harsh:
+\begin{itemize}
+  \item exploration is needed to find the moving/blinking box;
+  \item a single bad forward policy can create repeated \(-201\) transitions;
+  \item attachment is not enough, because a wrong-side attachment can lead to large
+        stuck penalties before success;
+  \item avoiding penalties is often locally better than attempting a risky push, so
+        naive RL can converge to conservative turning or weak search behavior.
+\end{itemize}
+
+This reward geometry explains why policies that look qualitatively active can score
+worse than a passive baseline.  The successful solution therefore had to be
+explorative enough to locate the box, but conservative enough to avoid repeated
+stuck states.
+
+\section{Observation Engineering}
+
+\subsection{No-wall PPO Encoding}
+
+For the no-wall branch, the strongest checkpoint used a compact encoded observation
+of dimension 32.  It concatenates the raw 18-bit observation with 14 derived features:
+\[
+  \phi_{\text{nw}}(o_t) =
+  [o_t, d_t] \in \mathbb{R}^{32},
+\]
+where \(d_t\) contains:
+\[
+\begin{array}{ll}
+\text{directional hit flags} & \mathbf{1}\{\text{left hit}\}, \mathbf{1}\{\text{front hit}\}, \mathbf{1}\{\text{right hit}\},\\
+\text{terminal bits} & b_{\text{IR}}, b_{\text{stuck}}, \mathbf{1}\{\text{blind}\},\\
+\text{counts} & n_{\text{left}}, n_{\text{front}}, n_{\text{right}}, n_{\text{front-far}}, n_{\text{front-near}},\\
+\text{differences} & n_{\text{left}}-n_{\text{right}}, n_{\text{right}}-n_{\text{left}},
+n_{\text{front}}-\frac{1}{2}(n_{\text{left}}+n_{\text{right}}).
+\end{array}
+\]
+This representation was effective for no-wall difficulty 3 because it made the
+relative salience of front versus side contacts directly visible to a small MLP.
+
+\subsection{Wall Actor Memory Features}
+
+For wall handling, instantaneous observations were not enough.  The wall actor uses
+the legal feature vector
+\[
+  x_t =
+  [
+    o_{t-11:t},
+    \operatorname{onehot}(a_{t-6:t-1}),
+    m_t,
+    c_t
+  ],
+\]
+where \(o_{t-11:t}\) is a 12-frame observation stack, the action history stores the
+last 6 actions, \(m_t \in \{0,1\}^{17}\) is a sensor-seen mask over bits \(0\ldots16\),
+and \(c_t \in \mathbb{R}^8\) contains normalized counters:
+\[
+  c_t =
+  [
+  \text{blind streak},
+  \text{stuck streak},
+  \text{last-seen side},
+  \text{contact memory},
+  \text{step fraction},
+  \text{repeated-observation streak},
+  \text{blind-turn streak},
+  \text{stuck memory}
+  ].
+\]
+For the final wall checkpoint:
+\[
+  \dim(x_t) = 12\cdot18 + 6\cdot5 + 17 + 8 = 271.
+\]
+All of these features are legal because they are derived from the current and past
+18-bit observations plus the actions emitted by the policy.
+
+\section{Asymmetric PPO}
+
+The main training idea was to use asymmetric actor-critic learning.  The deployed
+actor receives only \(x_t\), the legal observation-memory vector.  The critic receives
+both \(x_t\) and privileged simulator features \(p_t\):
+\[
+  \pi_\theta(a_t \mid x_t), \qquad
+  V_\psi(x_t, p_t).
+\]
+This improves the value function without leaking privileged information into the
+submitted policy.
+
+The privileged vector has dimension 34.  It includes normalized robot position,
+\(\sin/\cos\) robot heading, box position, relative robot-box vector, relative
+distance, relative heading, push-active flag, visibility flag, stuck flag, step
+fraction, wall flag, difficulty, box speed, box velocity, boundary margins, goal
+distance, wall-gap geometry, and terms indicating which side of the wall the robot
+and box occupy.  These inputs are used only during training.
+
+The PPO objective used clipped policy updates:
+\[
+  L_{\pi}(\theta) =
+  \mathbb{E}_t
+  \left[
+    \min
+    \left(
+      \rho_t(\theta)\hat{A}_t,\;
+      \operatorname{clip}(\rho_t(\theta),1-\epsilon,1+\epsilon)\hat{A}_t
+    \right)
+  \right],
+\]
+where
+\[
+  \rho_t(\theta)
+  =
+  \frac{\pi_\theta(a_t\mid x_t)}{\pi_{\theta_{\text{old}}}(a_t\mid x_t)}.
+\]
+Advantages were computed with GAE:
+\[
+  \hat{A}_t =
+  \sum_{l=0}^{\infty}(\gamma\lambda)^l
+  \delta_{t+l},\qquad
+  \delta_t = r_t + \gamma V_\psi(x_{t+1},p_{t+1}) - V_\psi(x_t,p_t).
+\]
+The critic was optimized with a clipped value loss, while entropy regularization was
+used to prevent premature collapse to simple turning or forward-only policies.
+
+\section{Final Model Architecture}
+
+\subsection{Wall Branch}
+
+The wall branch is an actor-only MLP at inference time:
+\[
+  271 \rightarrow 512 \rightarrow 256 \rightarrow 128 \rightarrow 5.
+\]
+The hidden activations are \(\tanh\), and the output is a 5-dimensional logit vector
+over \(\{\texttt{L45},\texttt{L22},\texttt{FW},\texttt{R22},\texttt{R45}\}\).
+The checkpoint stored in the final submission contains the actor weights and the full
+asymmetric model checkpoint for reproducibility, but only the actor backbone and policy
+head are loaded at deployment.
+
+The wall branch was trained with \path{assym_ppo/train_asym_ppo.py}.  The checkpoint
+metadata for the deployed wall actor records:
+\[
+\begin{array}{ll}
+\text{number of vectorized environments} & 512,\\
+\text{rollout length} & 128,\\
+\text{training steps} & 1{,}000{,}000,\\
+\text{actor hidden sizes} & [512,256,128],\\
+\text{critic hidden sizes} & [1024,512,256],\\
+\gamma & 0.995,\\
+\lambda_{\text{GAE}} & 0.95,\\
+\text{learning rate} & 1.5\times 10^{-4},\\
+\text{entropy coefficient} & 0.002,\\
+\text{warm-start expert} & \texttt{eval300},\\
+\text{warm-start episodes} & 20.
+\end{array}
+\]
+Reward shaping during this phase included visibility and IR bonuses, a larger stuck
+penalty, approach progress, alignment progress, and push progress.  The policy was
+still evaluated with the raw environment reward.
+
+\subsection{No-wall Branch}
+
+The no-wall branch is a standard PPO actor-critic checkpoint deployed as an actor MLP:
+\[
+  32 \rightarrow 128 \rightarrow 64 \rightarrow 5.
+\]
+Its checkpoint in the final bundle is \path{ppo_lab/nowall_d3_ppo_v3.pth}.  It was
+trained using \path{PPO/train_ppo.py} with the CUDA vectorized environment:
+\[
+\begin{array}{ll}
+\text{environment backend} & \texttt{torch\_vec},\\
+\text{environment device} & \texttt{cuda},\\
+\text{number of environments} & 256,\\
+\text{rollout length} & 128,\\
+\text{total environment steps} & 4{,}194{,}304,\\
+\text{difficulty} & 3,\\
+\text{wall obstacles} & \texttt{False},\\
+\text{max steps} & 2000,\\
+\text{learning rate} & 2\times10^{-4},\\
+\text{entropy coefficient} & 0.005,\\
+\text{update epochs} & 6,\\
+\text{initial checkpoint} & \texttt{ppo\_lab/nowall\_d3\_ppo\_v1.pth}.
+\end{array}
+\]
+This branch was kept because its no-wall return was much higher than the hand-written
+or recurrent alternatives.
+
+\section{Mode Switching}
+
+The final submission is not a single monolithic neural network.  It is a lightweight
+mixture of two policies with an observation-only switch.
+
+For the first 80 steps, the agent uses the wall branch as a probe policy and records:
+\[
+\begin{aligned}
+  C &= \text{number of front-near/contact-like observations},\\
+  B &= \text{number of blind observations},\\
+  F &= \text{total number of front sensor hits}.
+\end{aligned}
+\]
+At the end of the probe window, it switches to the no-wall branch when
+\[
+  C \le 15,\qquad B \ge 40,\qquad F \ge 0.
+\]
+Otherwise it stays with the wall branch.  The first two inequalities are the actual
+discriminative tests: no-wall starts often produce a long blind/search segment with
+little contact, while wall starts more often produce early side/front contacts or
+stuck-like structure.
+
+The final file also includes a small exact-pattern boost controller for two early
+observation patterns:
+\[
+\begin{aligned}
+  &(0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0),\\
+  &(1,1,0,1,0,0,0,0,0,0,0,0,1,1,1,1,0,0).
+\end{aligned}
+\]
+This boost controller uses only binarized observation bits, dead-reckoned heading from
+the agent's own turns, a small wall-hit memory, contact memory, and stuck recovery.
+It handles a small number of starts where the neural branch was too hesitant or where
+early wall/box contacts required a deterministic recovery routine.
+
+\begin{lstlisting}[language=Python,caption={High-level final policy logic.}]
+def policy(obs, rng):
+    if new_episode:
+        reset_probe_and_memory()
+
+    if initial_observation_matches_boost_pattern:
+        if boost_is_still_active:
+            return handmade_boost_controller(obs)
+
+    if step < 80:
+        update_probe_statistics(obs)
+        return wall_policy(obs)
+
+    if not decided:
+        use_nowall = contact_count <= 15 and blind_count >= 40
+        decided = True
+
+    if use_nowall:
+        return nowall_policy(obs)
+    return wall_policy(obs)
+\end{lstlisting}
+
+\section{Methods Tried Before the Final Agent}
+
+Several alternative approaches were tested before settling on the final asymmetric-PPO
+switch agent.  The main failure mode across these alternatives was the same: a policy
+could be good at either finding the box or avoiding penalties, but not both under the
+difficulty-3 wall setting.
+
+\subsection{Plain PPO on Raw Observations}
+
+The first PPO runs used \path{PPO/train_ppo.py} with the 18-bit observation or the
+32-dimensional count-augmented observation.  Vectorized CUDA rollouts made these runs
+fast, but wall policies frequently converged to low-mobility turning/search behaviors
+or to repeated forward pushes that accumulated stuck penalties.  The no-wall PPO
+branch eventually became strong, but the same style of policy did not robustly handle
+walls.
+
+\subsection{Handcrafted and Reactive Controllers}
+
+Several hand-written controllers were created in \path{handmade/} and \path{ppo_lab/}.
+They used sector counts, last-seen side, and stuck recovery plans.  These controllers
+were useful for debugging reward mechanics and as warm-start experts, but they were
+brittle.  Small changes in the moving-box path or wall geometry could make them attach
+from the wrong side, leading to repeated \(-201\) stuck penalties.
+
+\subsection{Paper-Style Subsumption and Clustered Q-Learning}
+
+The \path{paper_algo/} directory implements a paper-style controller with separate
+``find'', ``push'', and ``unwedge'' behaviors and clustered state generalization.
+This was attractive because it matched the qualitative structure of the task.  In
+practice, the conservative reward and moving/blinking target made the learned clusters
+too coarse for reliable difficulty-3 wall behavior.  It remained useful as a conceptual
+baseline but was not the final approach.
+
+\subsection{Parallel DDQN}
+
+The \path{parallel_ddqn/} directory contains a subprocess/vectorized DDQN trainer.  It
+was tested as an off-policy alternative to PPO.  DDQN was less stable in this problem:
+the sparse success reward, high stuck penalty, and partial observability caused large
+Q-value variance, and replay did not solve the need for memory and mode detection.
+
+\subsection{GRU Pose-Memory Policies}
+
+The \path{gru_pose/} and \path{nowall_lab/} experiments added recurrent memory, relative
+pose estimates, action histories, and DAgger-style teachers.  These models improved
+some shorter-horizon or no-wall settings, but the wall setting remained fragile.  For
+example, some wall GRU runs scored around \(-1977\) at the 2000-step scale, close to a
+passive policy and below the final wall branch.
+
+\subsection{Mode Classifiers and Initial-State Switching}
+
+The \path{mode_switch/} experiments trained recurrent classifiers to distinguish
+static/no-wall/moving-wall modes from early observation-action sequences.  This
+validated the idea that early probe statistics contain useful routing information.
+However, learned mode classifiers added another failure point.  The final switch uses
+a simpler deterministic probe statistic instead of an additional neural classifier.
+
+\subsection{Recurrent Asymmetric PPO and Teacher Transfer}
+
+Several recurrent asymmetric PPO and teacher-transfer runs were tried in
+\path{assym_ppo/} and \path{d3_wall_search/}, including GRU/LSTM policies, privileged
+teacher warm-starts, online teacher loss, and recurrent behavior cloning.  The
+important lesson was that teacher-mixed rollouts could look good during training but
+collapse during pure policy evaluation: the student relied on teacher action takeover
+and did not recover alone in hard wall states.  The files
+\path{mixed_wall_d3_teacheronline_gru_s502.pth},
+\path{mixed_wall_d3_teacheronline_lstm_s501.pth},
+\path{mixed_wall_d3_teacherbc_gru_s503.pth}, and
+\path{mixed_wall_d3_teacherbc_unshaped_gru_s504.pth} record this line of search.
+
+\section{Final Evaluation}
+
+The final submission package is
+\path{assym_ppo/submission_switch_d3_v3base/submission_switch_d3_v3base.zip}.
+It contains exactly \path{agent.py} and \path{weights.pth}.
+The local evaluation used \path{evaluate.py} with ten runs, base seed 0, difficulty 3,
+box speed 2, and \(T=2000\).  The seeds are therefore \(0,1,\ldots,9\).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Condition & Mean return & Std. dev. & Runs \\
+\midrule
+No wall, difficulty 3 & 1820.4 & 1539.7 & 10 \\
+Wall, difficulty 3 & -1142.8 & 1846.5 & 10 \\
+\midrule
+Weighted score \(0.4R_{\text{nw}}+0.6R_{\text{w}}\) & 42.48 & -- & -- \\
+\bottomrule
+\end{tabular}
+\caption{Final local evaluation of \texttt{submission\_switch\_d3\_v3base.zip}.}
+\end{table}
+
+For comparison, several wall-only candidates screened after the final submission were
+worse on the same wall evaluation seeds:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Candidate & Wall mean return \\
+\midrule
+\path{wall_tuned_v1_final.pth} & -1531.2 \\
+\path{wall_tuned_v2_ft500_gpu.pth} & -1531.2 \\
+\path{wall_tuned_v2_ft500_gpu_snapshot1.pth} & -1531.2 \\
+\path{d3_wall_exactboost_ws_rich_v1_final.pth} & -1531.2 \\
+\path{asymm_posemem_wall_v1.pth} & -80912.8 \\
+\bottomrule
+\end{tabular}
+\caption{Post-hoc wall checkpoint screen.  These were not selected because they did
+not improve the final wall branch.}
+\end{table}
+
+\section{Reproducibility}
+
+The final evaluation can be reproduced with:
+
+\begin{lstlisting}[language=bash]
+source /home/rycker/src/anaconda3/etc/profile.d/conda.sh
+conda activate torch
+cd "/home/rycker/study/CS780 RL"
+
+python CS780-OBELIX/evaluate.py \
+  --agent_file CS780-OBELIX/assym_ppo/submission_switch_d3_v3base/agent.py \
+  --agent_name switch_d3_v3base_nowall \
+  --runs 10 \
+  --seed 0 \
+  --max_steps 2000 \
+  --difficulty 3
+
+python CS780-OBELIX/evaluate.py \
+  --agent_file CS780-OBELIX/assym_ppo/submission_switch_d3_v3base/agent.py \
+  --agent_name switch_d3_v3base_wall \
+  --runs 10 \
+  --seed 0 \
+  --max_steps 2000 \
+  --difficulty 3 \
+  --wall_obstacles
+\end{lstlisting}
+
+The no-wall PPO branch was trained with a command equivalent to:
+
+\begin{lstlisting}[language=bash]
+python CS780-OBELIX/PPO/train_ppo.py \
+  --env_backend torch_vec \
+  --env_device cuda \
+  --device cuda \
+  --out CS780-OBELIX/ppo_lab/nowall_d3_ppo_v3.pth \
+  --init_checkpoint CS780-OBELIX/ppo_lab/nowall_d3_ppo_v1.pth \
+  --num_envs 256 \
+  --rollout_steps 128 \
+  --total_env_steps 4194304 \
+  --max_steps 2000 \
+  --difficulty 3 \
+  --box_speed 2 \
+  --hidden_dims 128 64 \
+  --lr 0.0002 \
+  --ent_coef 0.005 \
+  --update_epochs 6 \
+  --minibatch_size 8192 \
+  --schedule fixed \
+  --fw_bias_init 1.0 \
+  --rec_enco \
+  --seed 41
+\end{lstlisting}
+
+The wall actor branch was trained with asymmetric PPO, using only legal actor features
+for the policy and privileged features for the critic:
+
+\begin{lstlisting}[language=bash]
+python CS780-OBELIX/assym_ppo/train_asym_ppo.py \
+  --out CS780-OBELIX/assym_ppo/wall_tuned_v1.pth \
+  --env_device cuda \
+  --device cuda \
+  --num_envs 512 \
+  --rollout_steps 128 \
+  --total_env_steps 1000000 \
+  --max_steps 300 \
+  --difficulty 0 \
+  --wall_obstacles \
+  --obs_stack 12 \
+  --action_hist 6 \
+  --actor_hidden_dims 512 256 128 \
+  --critic_hidden_dims 1024 512 256 \
+  --lr 0.00015 \
+  --ent_coef 0.002 \
+  --reward_scale 5.0 \
+  --reward_clip 100.0 \
+  --visible_bonus 0.5 \
+  --ir_bonus 1.5 \
+  --stuck_extra_penalty 2.0 \
+  --approach_progress_bonus 35.0 \
+  --alignment_bonus 0.75 \
+  --push_progress_bonus 120.0 \
+  --warm_start_expert eval300 \
+  --warm_start_episodes 20 \
+  --warm_start_epochs 4 \
+  --eval_runs 10 \
+  --seed 0
+\end{lstlisting}
+
+\section{Legality and Deployment}
+
+The final submitted policy reads only the observation argument passed to
+\texttt{policy(obs, rng)}.  The privileged critic and simulator-state tensors are
+training-only.  At inference time:
+\begin{itemize}
+  \item the wall actor receives only \(x_t\), which is derived from legal observations
+        and previous actions;
+  \item the no-wall actor receives only the current 18-bit observation through the
+        32-dimensional legal encoder;
+  \item the switch uses only early observation counts;
+  \item the handcrafted boost uses only observation bits and dead reckoning from the
+        policy's own actions.
+\end{itemize}
+The code uses the evaluator's \texttt{rng} object as an episode-reset key for stateful
+memory, but it does not sample random actions or inspect simulator state.  If an
+interpretation of the rules forbids using \texttt{rng} identity as an episode boundary
+signal, the stricter observation-reset submission in \path{strict_obs/} should be used
+instead, but it scored lower in local evaluation.
+
+\section{Conclusion}
+
+The main reason the final agent worked better than the earlier attempts was not a
+larger network alone.  The successful design separated three concerns:
+\begin{enumerate}
+  \item use asymmetric PPO so the critic can learn from true pose, box state, wall
+        geometry, and attachment state while the actor remains deployable from legal
+        observations only;
+  \item specialize the no-wall policy, where vectorized PPO with a compact 32-feature
+        observation solved the moving/blinking box search well;
+  \item use a simple observation-only probe switch so the agent can route wall and
+        no-wall starts to different policies.
+\end{enumerate}
+This combination avoided the main failure modes found during the search: passive
+turning policies, wrong-side wall attachments, recurrent teacher-transfer collapse,
+and overly brittle hand-written controllers.
+
+\end{document}
