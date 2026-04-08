@@ -1,0 +1,7 @@
+timestamp_utc,agent_name,mean_score,std_score,runs,max_steps,scaling_factor,arena_size,wall_obstacles,difficulty,box_speed
+2026-04-06T17:41:59.359902+00:00,d3_wall_student_balanced_v1_nowall,1050.400000,1478.668469,10,2000,5,500,0,3,2
+2026-04-06T17:42:28.087431+00:00,d3_wall_student_balanced_v1_wall,51.600000,1993.730433,10,2000,5,500,1,3,2
+2026-04-06T17:48:30.500608+00:00,d3_wall_student_balanced_v1_probe20_wall,51.600000,1993.730433,10,2000,5,500,1,3,2
+2026-04-06T17:49:22.379761+00:00,d3_wall_student_balanced_v1_probe20_nowall,-1491.300000,1199.429952,10,2000,5,500,0,3,2
+2026-04-06T17:52:37.071111+00:00,d3_wall_student_balanced_v1_final_nowall,1050.400000,1478.668469,10,2000,5,500,0,3,2
+2026-04-06T17:53:06.848276+00:00,d3_wall_student_balanced_v1_final_wall,51.600000,1993.730433,10,2000,5,500,1,3,2

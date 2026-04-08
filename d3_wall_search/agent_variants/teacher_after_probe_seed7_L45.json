@@ -1,0 +1,1 @@
+{"seed": 7, "probe": ["L45"], "probe_obs": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "score": 2091.0, "steps_after_probe": 37, "actions": ["R45", "R45", "R45", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "R45", "R22", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW", "FW"]}
