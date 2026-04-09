@@ -1,0 +1,184 @@
+\documentclass[11pt, oneside]{article}   	% use "amsart" instead of "article" for AMSLaTeX format
+%\usepackage{geometry} 
+\usepackage[margin=0.8in]{geometry}                		% See geometry.pdf to learn the layout options. There are lots.
+\geometry{letterpaper}  
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[numbers]{natbib}% ... or a4paper or a5paper or ... 
+%\geometry{landscape}                		% Activate for rotated page geometry
+%\usepackage[parfill]{parskip}    		% Activate to begin paragraphs with an empty line rather than an indent
+\usepackage{graphicx}				% Use pdf, png, jpg, or eps§ with pdflatex; use eps in DVI mode
+								% TeX will automatically convert eps --> pdf in pdflatex		
+\usepackage{amssymb}
+\usepackage{hyperref}
+
+%SetFonts
+
+%SetFonts
+%\vspace{-5ex}
+
+%\title{\vspace{-10ex} Research Proposal: Computational Morality \vspace{-5ex}}
+\title{CS780 Capstone Project: 
+OBELIX: the Warehouse Robot
+}
+
+\author{
+    FirstName $<$Middle Name if any$>$ LastName  \\ 
+    roll no.\\
+   {\tt \{name\}@iitk.ac.in}\\
+{Indian Institute of Technology Kanpur (IIT Kanpur)}
+}
+
+
+\date{}							% Activate to display a given date or no date
+
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+
+Write a concise abstract (maximum 100 words) summarizing: The problem you solved (OBELIX robot learning to find, push and unwedge a box), Your main approach / algorithm family, Key experiments / innovations you tried
+
+\end{abstract}
+
+\section*{Important Guidelines (remove this section before final submission)}
+\begin{enumerate}
+    % \item Please do not show your creativity (you are already chance in the competition!) and  do not change the title and follow the format that is there above.
+\item Follow the sections given below, you should have the same sections in your report.
+\item \textbf{The maximum length of the report is maximum 8 pages (without references and llm usage declaration ), not even a single character more!} You can use any number of pages for references. This is a strict limit. If your report exceeds by even one character, you get a zero.
+\item The sections given below are compulsory and you should cover the points mentioned below. Also I have written the things point-wise, of course you will write properly in paragraph format. However, you are free to have more things within the sections as well. You can create subsections within a section.  Creativity and innovation counts! 
+\item There should be no grammar or spelling mistakes! Please use Grammarly, you have free subscription! 
+\item As already pointed out, we are very strict about plagiarism. We will be using softwares to check for plagiarism. So please cite the relevant papers/sources and do not copy paste from somewhere. Explain techniques/methods from your perspective. If your report is found to be plagiarized then the entire group gets a F grade in the course.  
+\item You can cite papers like this \cite{sepehr:AAMAS2019, colombo:NAACL2019}. You can create a footnote like this \footnote{\url{https://en.wikipedia.org}} 
+\item If you write any mathematical equations please use latex. 
+\item You can have images in your report but do not forget to cite them, if you have taken from somewhere. Do not paste an image directly from the papers, make sure the images are of high quality and should not get blurred on zooming. So best way to do it use either SVG images or PDF images. In general, it is always better to create images on your own. 
+\item Use the quotation marks properly, use these ``Quote" instead of these "Quote"
+\item In your final report, obviously remove these guidelines. 
+\item \textbf{LLM usage is allowed only in very limited ways} — see Capstone document.
+\item Creativity, novelty, deep analysis, good visualizations will be highly rewarded.
+
+\item Completing the LLM Usage Declaration is mandatory. Reports without a completed LLM Usage Declaration (or with incomplete/inconsistent answers) will not be evaluated and will receive zero marks for the entire capstone.  
+
+\end{enumerate}
+
+\section{Competition Result}
+\textbf{Codabench Username:} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Final leaderboard rank (Test Phase):} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Leaderboard rank – Level 1 (static):} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Leaderboard rank – Level 2 (blinking):} \_\_\_\_\_\_\_\_\_\_\_ \\
+\textbf{Leaderboard rank – Level 3 (moving + blinking):} \_\_\_\_\_\_\_\_\_\_\_ \\
+
+\textbf{Number of valid submissions made (Development(Level 1 , Level 2, Level 3) and Test Test):} Create a Table
+
+\section{Introduction and Problem Description}
+\begin{itemize}
+    \item Briefly introduce the motivation.
+    \item Describe the core task: find $\to$ attach $\to$ push $\to$ unwedge grey box to boundary
+    \item Explain the environment.
+    \item Describe the three difficulty levels (static, blinking, moving+blinking) and optional wall obstacle
+    \item Mention that this is a POMDP setting and why it is challenging
+    \item State your high-level goal: maximize mean cumulative reward across difficulties and robustness to walls
+\end{itemize}
+
+\section{Approach and Model Evolution}
+\begin{itemize}
+    \item Baseline / initial attempts
+    \item Evolution across phases:
+        \begin{itemize}
+            \item what you tried first, what worked, what failed, key changes / new ideas.
+            \item Test phase: final strategy
+        \end{itemize}
+    \item Detailed description of final / best model(s)
+        \begin{itemize}
+            \item Algorithm family (tabular Q, DQN, Double DQN, Dueling, PPO, actor-critic, etc.)
+            \item Network architecture (if deep) – include figure
+            \item State representation (raw 18 bits? any hand-crafted features?)
+            \item Exploration strategy ($\epsilon$-greedy, entropy bonus, etc.)
+            \item Reward shaping (if used – and justification)
+            \item Any hierarchical / modular / behavior-based ideas inspired by original paper?
+        \end{itemize}
+\end{itemize}
+
+\section{Experiments and Implementation Details}
+\begin{itemize}
+    \item Training setup: episodes, max steps (2000), hardware (CPU/GPU), time taken
+    \item Optimizer, learning rate schedule, batch size, discount factor ($\gamma$), target update frequency, replay buffer size, etc.
+    \item Hyperparameter table (one per major model variant)
+    \item Multi-task / curriculum learning (if you trained on mixed difficulties)
+    \item Local evaluation strategy (how many seeds, how you avoided overfitting)
+\end{itemize}
+
+\section{Results}
+\begin{itemize}
+    \item Table: performance of different models/variants on development phases (Level 1, 2, 3)
+    \item Table: final test phase results (all levels)
+    \item Learning curves 
+    \item Which model performed best overall? Why do you think so? (generalization, sample efficiency, robustness)
+\end{itemize}
+
+\section{Error Analysis and Discussion}
+\begin{itemize}
+    \item Common failure modes per difficulty level
+        \begin{itemize}
+            \item Level 1: why does it sometimes fail even when box is static?
+            \item Level 2: problems due to blinking (losing track, false negatives)
+            \item Level 3: issues with moving box (prediction, interception)
+            \item With walls: navigation / collision failures
+        \end{itemize}
+
+    \item What limitations remain? What would you improve with more time?
+    \item Any surprising findings or novel insights?
+\end{itemize}
+
+\section{Conclusion}
+\begin{itemize}
+    \item Summarize key achievements (performance, lessons learned)
+    \item Most important takeaway about RL in partially observable robotic tasks
+    \item Possible future directions (better POMDP methods, real robot transfer, more realistic physics, multi-box, etc.)
+\end{itemize}
+
+\section*{LLM Usage Declaration}
+\begin{itemize}
+\item Which Large Language Model (LLM) did you use to complete the competition or write the report? \\
+
+\item In which part did you use the LLM, and how did it help you?
+
+\begin{tabular}{l|l|l}
+\toprule
+Part & Used LLM? (Yes/No) & Purpose of Using LLM \\
+\midrule
+Understanding concepts &  &   \\
+Ideation / brainstorming &  &   \\
+Debugging small code snippets &  &   \\
+Plotting / visualization code &  &   \\
+Grammar / writing style &  &   \\
+Report structure / section ideas &  &  \\
+Other (specify) &  &   \\
+\bottomrule
+\end{tabular}
+
+\item Did you refer to any other sources or websites apart from the LLM and lecture slides? \\
+If yes, please mention clearly (papers, blogs, GitHub repos, textbooks etc.)
+
+\item Apart from any LLM usage, what was your own contribution? \\
+Briefly describe your personal understanding, reasoning, implementation effort, analysis, and experimentation.
+\end{itemize}
+
+\vspace{2cm}
+
+\bibliographystyle{ieeetr}
+\bibliography{references}
+
+% Optional appendix (only if explicitly allowed by TAs)
+% \newpage
+% \appendix
+% \section{Additional Plots / Ablations}
+
+\end{document}

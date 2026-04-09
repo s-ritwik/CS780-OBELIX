@@ -1,39 +1,44 @@
-\documentclass[11pt]{article}
-
+\documentclass[11pt, oneside]{article}   	% use "amsart" instead of "article" for AMSLaTeX format
+%\usepackage{geometry} 
+\usepackage[margin=0.8in]{geometry}                		% See geometry.pdf to learn the layout options. There are lots.
+\geometry{letterpaper}  
 \usepackage[margin=1in]{geometry}
-\usepackage{amsmath}
-\usepackage{amssymb}
 \usepackage{booktabs}
-\usepackage{array}
-\usepackage{xcolor}
 \usepackage{hyperref}
-\usepackage{listings}
 \usepackage{enumitem}
-\usepackage{mathtools}
 \usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[numbers]{natbib}% ... or a4paper or a5paper or ... 
+%\geometry{landscape}                		% Activate for rotated page geometry
+%\usepackage[parfill]{parskip}    		% Activate to begin paragraphs with an empty line rather than an indent
+\usepackage{graphicx}				% Use pdf, png, jpg, or eps§ with pdflatex; use eps in DVI mode
+								% TeX will automatically convert eps --> pdf in pdflatex		
+\usepackage{amssymb}
+\usepackage{hyperref}
 
-\hypersetup{
-  colorlinks=true,
-  linkcolor=blue!60!black,
-  urlcolor=blue!60!black,
-  citecolor=blue!60!black,
-  hypertexnames=false
+%SetFonts
+
+%SetFonts
+%\vspace{-5ex}
+
+%\title{\vspace{-10ex} Research Proposal: Computational Morality \vspace{-5ex}}
+\title{CS780 Capstone Project: 
+OBELIX: the Warehouse Robot
 }
 
-\lstset{
-  basicstyle=\ttfamily\small,
-  breaklines=true,
-  columns=fullflexible,
-  frame=single,
-  xleftmargin=0.5em,
-  xrightmargin=0.5em
+\author{
+    FirstName $<$Middle Name if any$>$ LastName  \\ 
+    roll no.\\
+   {\tt \{name\}@iitk.ac.in}\\
+{Indian Institute of Technology Kanpur (IIT Kanpur)}
 }
 
-\title{\textbf{Solving OBELIX with Asymmetric PPO, Privileged Critics, and an Observation-Only Switch Policy}}
-\author{CS780 Capstone Project}
-\date{}
+
+\date{}							% Activate to display a given date or no date
 
 \begin{document}
+
 \maketitle
 
 \begin{abstract}
@@ -1192,5 +1197,6 @@ passive turning policies, wrong-side wall attachments, brittle hand-written reco
 teacher-dependent recurrent collapse. The final weighted score is still limited by the
 hard wall regime, but the resulting submission is the strongest balanced controller found
 under the available compute budget and the project rules.
+
 
 \end{document}
