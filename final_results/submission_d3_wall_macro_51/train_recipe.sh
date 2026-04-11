@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source /home/rycker/src/anaconda3/etc/profile.d/conda.sh
 conda activate torch
-cd "${ROOT_DIR}"
+cd "${PROJECT_DIR}"
 
 # Phase 1: difficulty-3 no-wall PPO branch.
 python CS780-OBELIX/PPO/train_ppo.py \
@@ -99,4 +100,4 @@ python final_results/submission_d3_wall_macro_51/code/search_prefix_with_agent.p
   --limit 20
 
 # Phase 4: exact submission rebuild.
-./final_results/submission_d3_wall_macro_51/rebuild_exact.sh
+"${SCRIPT_DIR}/rebuild_exact.sh"

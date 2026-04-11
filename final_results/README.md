@@ -2,14 +2,15 @@
 
 This directory collects the three submission variants selected for final review:
 
-- `submission_d3_router_w5_guard_t078`
-- `submission_probe_switch_exactboost`
+- `submission_probe_switch_exactboost_singleweight`
 - `submission_d3_wall_macro_51`
+- `submission_d3_router_w5_guard_t078_v1`
 
 Each subdirectory contains:
 
 - `agent.py`: the exact submission agent file.
 - `weights.pth`: the exact submission weights bundle.
+- `submission_*.zip`: the packaged submission archive corresponding to that folder.
 - `rebuild_exact.sh`: restores the exact submission files from the canonical source directory in this repo.
 - `train_recipe.sh`: the training/assembly recipe that produced the learned components used by the submission.
 - `code/`: copies of the training scripts used in that policy family.
