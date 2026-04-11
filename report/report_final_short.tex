@@ -108,9 +108,51 @@ This insight led to asymmetric PPO. The key idea was to let the actor observe on
 
 \subsection{Observation engineering}
 
-The no-wall branch used a compact 32-dimensional encoding formed by the raw 18 observation bits plus 14 derived features such as left/front/right hit flags, hit counts, front-near versus front-far counts, a blind-search flag, and left-right asymmetry measures. This representation was enough in the no-wall setting because the main difficulty there was search under blinking and movement, not fine obstacle negotiation.
+The no-wall branch used a compact 32-dimensional legal encoding. Let the raw observation be
+\[
+o_t=[b_0,\ldots,b_{15},b_{\mathrm{IR}},b_{\mathrm{stuck}}]\in\{0,1\}^{18}.
+\]
+The first 16 bits are sonar detections, partitioned as left sector \(b_{0:3}\), front sector \(b_{4:11}\), and right sector \(b_{12:15}\). Bit \(b_{\mathrm{IR}}\) indicates direct frontal contact and \(b_{\mathrm{stuck}}\) indicates that the robot is jammed. The no-wall actor did not use these 18 bits alone; instead it formed
+\[
+x_t=[o_t,\phi(o_t)]\in\mathbb{R}^{32},
+\]
+where \(\phi(o_t)\in\mathbb{R}^{14}\) is a deterministic feature map computed from the legal observation only. The exact 32-dimensional encoding is shown in Table~\ref{tab:obs32}.
 
-The wall setting required more memory. For that branch, a single observation was usually insufficient to distinguish blind search from repeated contact or a persistent jam. I therefore used a larger legal feature vector built from a short stack of recent observations, a one-hot encoding of recent actions, and a few simple counters derived only from legal sensor histories. This gave the actor enough temporal context to reason about short-term motion patterns without reading hidden simulator variables.
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{0.12\textwidth}p{0.18\textwidth}p{0.58\textwidth}}
+\toprule
+Indices & Name & Definition \\
+\midrule
+\(0\!:\!3\) & left sonar bits & Raw binary sonar indicators for the four left-facing sectors. \\
+\(4\!:\!11\) & front sonar bits & Raw binary sonar indicators for the eight front-facing sectors. \\
+\(12\!:\!15\) & right sonar bits & Raw binary sonar indicators for the four right-facing sectors. \\
+\(16\) & IR/contact bit & Raw frontal contact-style indicator. \\
+\(17\) & stuck bit & Raw jam/stuck indicator. \\
+\(18\) & left\_active & \(\mathbf{1}\{\sum_{i=0}^{3} b_i > 0\}\). \\
+\(19\) & front\_active & \(\mathbf{1}\{\sum_{i=4}^{11} b_i > 0\}\). \\
+\(20\) & right\_active & \(\mathbf{1}\{\sum_{i=12}^{15} b_i > 0\}\). \\
+\(21\) & IR copy & Direct copy of \(b_{\mathrm{IR}}\). \\
+\(22\) & stuck copy & Direct copy of \(b_{\mathrm{stuck}}\). \\
+\(23\) & blind & \(\mathbf{1}\{\sum_{i=0}^{15} b_i = 0\}\), indicating that no sonar sector is active. \\
+\(24\) & left\_count & \(\sum_{i=0}^{3} b_i\). \\
+\(25\) & front\_count & \(\sum_{i=4}^{11} b_i\). \\
+\(26\) & right\_count & \(\sum_{i=12}^{15} b_i\). \\
+\(27\) & front\_far\_count & Sum of front bits at offsets \(0,2,4,6\) within the front block, i.e. global indices \(4,6,8,10\). \\
+\(28\) & front\_near\_count & Sum of front bits at offsets \(1,3,5,7\) within the front block, i.e. global indices \(5,7,9,11\). \\
+\(29\) & left-minus-right & \(\text{left\_count} - \text{right\_count}\). \\
+\(30\) & right-minus-left & \(\text{right\_count} - \text{left\_count}\). \\
+\(31\) & front-minus-side-mean & \(\text{front\_count} - \tfrac{1}{2}(\text{left\_count}+\text{right\_count})\). \\
+\bottomrule
+\end{tabular}
+\caption{Exact 32-dimensional legal observation encoding used by the no-wall PPO branch. The first 18 entries are raw observations and the final 14 entries are derived deterministically from those same legal observations.}
+\label{tab:obs32}
+\end{table}
+
+This representation was sufficient in the no-wall setting because the main difficulty there was search under blinking and motion, not fine obstacle negotiation. The derived features summarize whether the robot is blind, whether detections are concentrated in the front or on one side, and whether the front pattern is near-dominant or far-dominant. In practice, this made the no-wall policy easier to optimize than using the 18-bit vector alone.
+
+The wall setting required more memory than the 32-dimensional feedforward encoding. For that branch, a single observation was usually insufficient to distinguish blind search from repeated contact or a persistent jam. I therefore used a larger legal recurrent feature vector built from a short stack of recent observations, recent actions, and counters derived from legal sensor histories only. These recurrent features included observation history, action history, blind/contact/stuck counters, seen-side memory, and wall-hit memory inferred through dead reckoning rather than from true simulator pose. This gave the actor enough temporal context to reason about short-term motion patterns without reading hidden simulator variables.
 
 \subsection{Why PPO and why asymmetric training}
 
