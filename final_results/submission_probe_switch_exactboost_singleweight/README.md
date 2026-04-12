@@ -4,9 +4,11 @@ Contents:
 
 - `agent.py`: exact submission agent.
 - `weights.pth`: exact bundled wall/no-wall checkpoint used by the submission.
-- `submission_probe_switch_exactboost_singleweight.zip`: packaged submission archive.
-- `rebuild_exact.sh`: restores `agent.py` and `weights.pth` from the canonical repo copy.
-- `train_recipe.sh`: reproduces the two learned components and then rebuilds the submission bundle.
+- `switch.zip`: final packaged submission archive.
+- `weights_rebuilt.pth`: rebuilt bundle generated from the saved component checkpoints already present in this repo.
+- `switch_rebuilt.zip`: rebuilt archive using `agent.py` plus `weights_rebuilt.pth`.
+- `rebuild_exact.sh`: restores `agent.py` from `switch.zip`, rebuilds `weights_rebuilt.pth`, checks semantic equality against `weights.pth`, and writes `switch_rebuilt.zip`.
+- `train_recipe.sh`: documents the training pipeline for the two learned components.
 - `code/`: copied trainer/source scripts used by this policy family.
 
 This submission is composed of:
@@ -17,7 +19,14 @@ This submission is composed of:
 
 The final bundled `weights.pth` is a dictionary with two entries:
 
-- `wall`: checkpoint payload corresponding to `CS780-OBELIX/assym_ppo/wall_tuned_v1.pth`
+- `wall`: checkpoint payload corresponding to `CS780-OBELIX/assym_ppo/wall_tuned_v1_final.pth`
 - `nowall`: checkpoint payload corresponding to `CS780-OBELIX/ppo_lab/nowall_fixed8m.pth`
 
-Use `./rebuild_exact.sh` if you want the exact submission artifact back in place.
+Checkpoint rebuild command:
+
+```bash
+cd /home/rycker/study/CS780\ RL/CS780-OBELIX/final_results/submission_probe_switch_exactboost_singleweight
+./rebuild_exact.sh
+```
+
+`weights_rebuilt.pth` is semantically identical to `weights.pth` after loading, but not byte-identical on disk because it is repacked with a fresh `torch.save`.

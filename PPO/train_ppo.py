@@ -8,7 +8,6 @@ This version is rollout-based and closer in spirit to rsl_rl PPO:
 - optional adaptive KL learning rate schedule
 - multi-epoch mini-batch updates
 
-Codabench still evaluates only the submitted policy(obs, rng) on CPU.
 """
 
 from __future__ import annotations

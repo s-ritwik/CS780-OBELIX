@@ -4,9 +4,75 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 REPO_DIR="${PROJECT_DIR}/CS780-OBELIX"
-SRC_DIR="${REPO_DIR}/d3_wall_search/submission_d3_wall_macro_51"
+SOURCE_ZIP="${SCRIPT_DIR}/wall_macro.zip"
+FINAL_WEIGHTS="${SCRIPT_DIR}/weights.pth"
+REBUILT_WEIGHTS="${SCRIPT_DIR}/weights_rebuilt.pth"
+REBUILT_ZIP="${SCRIPT_DIR}/wall_macro_rebuilt.zip"
 
-cp "${SRC_DIR}/agent.py" "${SCRIPT_DIR}/agent.py"
-cp "${SRC_DIR}/weights.pth" "${SCRIPT_DIR}/weights.pth"
-cp "${SRC_DIR}/submission_d3_wall_macro_51.zip" "${SCRIPT_DIR}/submission_d3_wall_macro_51.zip"
-echo "Restored exact submission_d3_wall_macro_51 bundle in ${SCRIPT_DIR}"
+rm -f "${SCRIPT_DIR}/agent.py" "${REBUILT_WEIGHTS}" "${REBUILT_ZIP}"
+
+python - <<'PY' "${SOURCE_ZIP}" "${SCRIPT_DIR}"
+import sys
+import zipfile
+from pathlib import Path
+
+zip_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+with zipfile.ZipFile(zip_path) as zf:
+    zf.extract("agent.py", out_dir)
+PY
+
+set +u
+source /home/rycker/src/anaconda3/etc/profile.d/conda.sh
+conda activate torch
+set -u
+
+python - <<'PY' "${REPO_DIR}" "${FINAL_WEIGHTS}" "${REBUILT_WEIGHTS}" "${REBUILT_ZIP}" "${SCRIPT_DIR}/agent.py"
+import hashlib
+import sys
+import zipfile
+from pathlib import Path
+from collections.abc import Mapping
+
+import torch
+
+repo_dir = Path(sys.argv[1])
+final_weights = Path(sys.argv[2])
+rebuilt_weights = Path(sys.argv[3])
+rebuilt_zip = Path(sys.argv[4])
+agent_path = Path(sys.argv[5])
+
+bundle = {
+    "wall": torch.load(repo_dir / "assym_ppo" / "wall_tuned_v1_final.pth", map_location="cpu", weights_only=False),
+    "nowall": torch.load(repo_dir / "ppo_lab" / "nowall_d3_ppo_v3.pth", map_location="cpu", weights_only=False),
+}
+torch.save(bundle, rebuilt_weights)
+
+def same(a, b):
+    if type(a) != type(b):
+        return False
+    if isinstance(a, torch.Tensor):
+        return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
+    if isinstance(a, Mapping):
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+    if isinstance(a, tuple):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    return a == b
+
+final_obj = torch.load(final_weights, map_location="cpu", weights_only=False)
+rebuilt_obj = torch.load(rebuilt_weights, map_location="cpu", weights_only=False)
+semantic_match = same(final_obj, rebuilt_obj)
+if not semantic_match:
+    raise SystemExit("semantic weight mismatch")
+
+with zipfile.ZipFile(rebuilt_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    zf.write(agent_path, "agent.py")
+    zf.write(rebuilt_weights, "weights.pth")
+
+print("semantic_match=True")
+print("final_sha256=", hashlib.sha256(final_weights.read_bytes()).hexdigest())
+print("rebuilt_sha256=", hashlib.sha256(rebuilt_weights.read_bytes()).hexdigest())
+print("rebuilt_zip=", rebuilt_zip)
+PY
