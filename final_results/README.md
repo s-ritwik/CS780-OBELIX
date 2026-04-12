@@ -1,6 +1,6 @@
 # Final Submission 
 
-Main code at:
+Main code at: https://github.com/s-ritwik/CS780-OBELIX
 
 This directory collects the three submissions for final phase capstone:
 
