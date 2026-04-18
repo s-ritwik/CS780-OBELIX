@@ -1,0 +1,2 @@
+timestamp_utc,agent_name,mean_score,std_score,runs,max_steps,scaling_factor,arena_size,wall_obstacles,difficulty,box_speed
+2026-04-17T18:20:30.161721+00:00,best_policy_generated_nowall,980.900000,1328.056810,10,2000,5,500,0,3,2
